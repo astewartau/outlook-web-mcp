@@ -1,0 +1,15 @@
+# systemd user unit: copy to ~/.config/systemd/user/, adjust paths and settings, then
+#   systemctl --user daemon-reload && systemctl --user enable --now outlook-browser
+[Unit]
+Description=Chromium for outlook-web-mcp (Xvfb + noVNC)
+After=network-online.target
+
+[Service]
+ExecStart=%h/outlook-web-mcp/browser/start-browser.sh
+# Environment=VIEW_ADDR=100.x.y.z
+Restart=on-failure
+RestartSec=10
+MemoryMax=4G
+
+[Install]
+WantedBy=default.target

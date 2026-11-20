@@ -1,0 +1,12 @@
+# Ubuntu 23.10+ blocks unprivileged user namespaces, so Chromium's sandbox fails with
+# "No usable sandbox!". This profile allows them for one Chromium binary, keeping the sandbox on.
+# Replace CHROME_PATH with the full path to the binary, then:
+#   sudo cp apparmor-chromium /etc/apparmor.d/outlook-web-mcp-chromium
+#   sudo apparmor_parser -r /etc/apparmor.d/outlook-web-mcp-chromium
+abi <abi/4.0>,
+include <tunables/global>
+
+profile outlook-web-mcp-chromium CHROME_PATH flags=(unconfined) {
+  userns,
+  include if exists <local/outlook-web-mcp-chromium>
+}

@@ -1,0 +1,17 @@
+{
+  "name": "outlook-web-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for Outlook on the web that drives a signed-in browser: no Microsoft Graph, no app registration, no admin consent",
+  "type": "module",
+  "bin": { "outlook-web-mcp": "src/server.mjs" },
+  "files": ["src", "browser", "skills"],
+  "engines": { "node": ">=20" },
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/astewartau/outlook-web-mcp.git" },
+  "keywords": ["mcp", "outlook", "owa", "playwright", "claude"],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "playwright": "^1.65.0",
+    "zod": "^4.1.0"
+  }
+}
