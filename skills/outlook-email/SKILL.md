@@ -29,3 +29,9 @@ description: Working rules for the outlook-web MCP tools (Outlook on the web thr
 - `outlook_mark` with `delete` or `archive` only when the user asks. Throw away a mistaken draft with `outlook_discard_draft`.
 - If a tool says the session expired, call `outlook_login` and pass the number it returns to the user to approve in their authenticator app, then call it again with `wait_seconds: 60`.
 - If something looks wrong, `browser_screenshot` shows the page.
+
+## When a tool fails
+
+- Retry the same outlook tool once (it reloads Outlook and clears pop-ups itself), then report the exact error.
+- Don't switch to general browser tools (Playwright MCP, screenshots plus clicking) to do Outlook work: they share the same browser and make things worse. Use `outlook_search` only as a different way to find mail, not as a workaround for a broken folder.
+- Never answer an Outlook prompt by guessing. Prompts about time zones, sending or deleting are for the user.
