@@ -6,6 +6,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 import { chromium } from 'playwright';
+import fs from 'fs';
 
 const CDP_URL = process.env.OUTLOOK_CDP_URL || 'http://127.0.0.1:9222';
 const BASE = (process.env.OUTLOOK_URL || 'https://outlook.cloud.microsoft').replace(/\/$/, '');
@@ -13,21 +14,53 @@ const ACCOUNT = process.env.OUTLOOK_ACCOUNT || '';           // account to pick 
 const TIMEZONE = process.env.OUTLOOK_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone;
 const SEND_ENABLED = /^(1|true|yes)$/i.test(process.env.OUTLOOK_ENABLE_SEND || '');
 
-let browser, queue = Promise.resolve();
+const TAB_NAME = 'outlook-web-mcp';
+const LOCK = process.env.OUTLOOK_LOCK_FILE || `/tmp/outlook-web-mcp-${process.getuid?.() ?? 'user'}.lock`;
+let browser, tab, queue = Promise.resolve();
 
-// One browser action at a time: every tool shares the one Outlook tab.
+// Every client (each Claude session starts its own server) shares one browser and one tab,
+// so calls are serialised within this process (queue) and across processes (lock file).
 function serial(fn) {
-  const run = queue.then(fn, fn);
+  const run = queue.then(() => withLock(fn), () => withLock(fn));
   queue = run.catch(() => {});
   return run;
 }
 
+async function withLock(fn) {
+  const deadline = Date.now() + 10 * 60 * 1000;
+  for (;;) {
+    try { fs.writeFileSync(LOCK, String(process.pid), { flag: 'wx' }); break; }
+    catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      const holder = +fs.readFileSync(LOCK, 'utf8') || 0;
+      let alive = false; try { process.kill(holder, 0); alive = true; } catch {}
+      if (!alive) { try { fs.unlinkSync(LOCK); } catch {} continue; }       // stale lock
+      if (Date.now() > deadline) throw new Error('Another session has been using Outlook for 10 minutes; try again later.');
+      await new Promise(r => setTimeout(r, 500));
+    }
+  }
+  try { return await fn(); } finally { try { if (fs.readFileSync(LOCK, 'utf8') === String(process.pid)) fs.unlinkSync(LOCK); } catch {} }
+}
+
+// The server's own tab, marked with window.name so it never adopts a tab someone else opened.
 async function page() {
-  if (!browser || !browser.isConnected()) browser = await chromium.connectOverCDP(CDP_URL);
+  if (!browser || !browser.isConnected()) { browser = await chromium.connectOverCDP(CDP_URL); tab = null; }
+  if (tab && !tab.isClosed()) return tab;
   const ctx = browser.contexts()[0];
-  let p = ctx.pages().find(p => /outlook\.(cloud\.microsoft|office\.com|office365\.com|live\.com)/.test(p.url()));
-  if (!p) { p = await ctx.newPage(); await p.goto(BASE + '/mail/'); }
-  return p;
+  for (const p of ctx.pages()) {
+    if (await p.evaluate(n => window.name === n, TAB_NAME).catch(() => false)) { tab = p; break; }
+  }
+  if (!tab) {
+    tab = await ctx.newPage();
+    await tab.goto(BASE + '/mail/');
+  }
+  await tab.evaluate(n => { window.name = n; }, TAB_NAME).catch(() => {});
+  // Outlook compares the browser's time zone with the mailbox's: report the user's zone, so it
+  // never offers to move the calendar to the server's zone.
+  const cdp = await ctx.newCDPSession(tab);
+  await cdp.send('Emulation.setTimezoneOverride', { timezoneId: TIMEZONE }).catch(() => {});
+  await tab.bringToFront().catch(() => {});
+  return tab;
 }
 
 async function signedIn(p) {
@@ -40,6 +73,12 @@ async function signedIn(p) {
 async function clearOverlays(p) {
   const cancel = p.locator('[role=dialog][aria-modal=true], [role=alertdialog]').getByRole('button', { name: /^(Cancel|No|Don't|Close)$/ }).first();
   if (await cancel.isVisible().catch(() => false)) { await cancel.click(); await p.waitForTimeout(800); }
+  // Known prompts, answered with the option that changes nothing ("You're on the move" time zone
+  // prompt: never "Yes", which would move the mailbox to the browser's zone).
+  for (const name of ['Not now', 'Skip', 'Maybe later', 'Got it']) {
+    const b = p.locator('[role=dialog], [role=alertdialog]').getByRole('button', { name, exact: true }).first();
+    if (await b.isVisible().catch(() => false)) { await b.click(); await p.waitForTimeout(800); }
+  }
   await p.evaluate(() => {
     for (const b of document.querySelectorAll('[data-portal-node=true] button[aria-label="Close"]')) {
       const pane = b.closest('[data-portal-node=true]');
@@ -52,6 +91,7 @@ async function ensureMail(p) {
   if (!/\/mail/.test(p.url()) || !(await signedIn(p))) {
     await p.goto(BASE + '/mail/');
     await p.waitForLoadState('domcontentloaded');
+    await p.evaluate(n => { window.name = n; }, TAB_NAME).catch(() => {});
   }
   await p.locator('[role=tree]').first().waitFor({ timeout: 30000 }).catch(() => {});
   if (!(await signedIn(p))) throw new Error('Not signed in to Outlook. Call outlook_login.');
@@ -100,7 +140,13 @@ async function openFolder(p, folder) {
   await expandFolders(p);
   const esc = folder.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
   const t = p.getByRole('treeitem', { name: new RegExp('^[\\s\\uE000-\\uF8FF]*' + esc + '( selected)?( \\d+ unread)?( \\[\\d+\\] items?)?$', 'i') });
-  if (!(await t.count())) throw new Error(`No folder named "${folder}". Use outlook_folders.`);
+  if (!(await t.count())) {
+    // the page may be mid-way through something else: reload the mail view and look again
+    await p.goto(BASE + '/mail/'); await p.locator('[role=tree]').first().waitFor({ timeout: 30000 }).catch(() => {});
+    await clearOverlays(p); await expandFolders(p);
+    if (!(await t.count())) throw new Error(`No folder named "${folder}". Folders are:\n` + fmtFolders(await folders(p)));
+  }
+  await t.last().scrollIntoViewIfNeeded().catch(() => {});
   await t.last().click();
   await p.locator('[role=listbox]').first().waitFor({ timeout: 15000 }).catch(() => {});
   await p.waitForTimeout(1500);
@@ -511,6 +557,7 @@ server.registerTool('outlook_calendar', {
   for (let i = 0; i < days; i++) { const d = new Date(start); d.setDate(d.getDate() + i); want.push(fmt(d)); }
   const seen = new Map();
   const cp = await (await page()).context().newPage();
+  await (await cp.context().newCDPSession(cp)).send('Emulation.setTimezoneOverride', { timezoneId: TIMEZONE }).catch(() => {});
   try {
     for (let i = 0; i < days; i += 7) {
       const d = new Date(start); d.setDate(d.getDate() + i);
