@@ -7,12 +7,14 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { chromium } from 'playwright';
 import fs from 'fs';
+import path from 'path';
 
 const CDP_URL = process.env.OUTLOOK_CDP_URL || 'http://127.0.0.1:9222';
 const BASE = (process.env.OUTLOOK_URL || 'https://outlook.cloud.microsoft').replace(/\/$/, '');
 const ACCOUNT = process.env.OUTLOOK_ACCOUNT || '';           // account to pick on the Microsoft sign-in page
 const TIMEZONE = process.env.OUTLOOK_TIMEZONE || Intl.DateTimeFormat().resolvedOptions().timeZone;
 const SEND_ENABLED = /^(1|true|yes)$/i.test(process.env.OUTLOOK_ENABLE_SEND || '');
+const DOWNLOAD_DIR = process.env.OUTLOOK_DOWNLOAD_DIR || `${process.env.HOME}/Downloads/outlook-attachments`;
 
 const TAB_NAME = 'outlook-web-mcp';
 const LOCK = process.env.OUTLOOK_LOCK_FILE || `/tmp/outlook-web-mcp-${process.getuid?.() ?? 'user'}.lock`;
@@ -318,6 +320,42 @@ async function leaveCompose(p) {
   await p.locator('[role=tree]').first().waitFor({ timeout: 30000 }).catch(() => {});
 }
 
+
+// Open a conversation either from a folder or from a search (search results are not a folder).
+async function openTarget(p, { folder, id, search }) {
+  if (search) {
+    await ensureMail(p);
+    const box = p.getByRole('combobox', { name: /search/i }).or(p.locator('input[aria-label*="Search"]')).first();
+    await box.click(); await box.fill(search); await p.keyboard.press('Enter');
+    await p.waitForTimeout(4000);
+    const it = await findItem(p, id); await it.click();
+  } else {
+    await openConversation(p, folder || 'Inbox', id, true);
+  }
+  await p.waitForTimeout(2000);
+  await p.evaluate(() => document.querySelectorAll('[aria-label="Reading Pane"] [aria-expanded=false][role=button]').forEach(b => b.click())).catch(() => {});
+  await p.waitForTimeout(1500);
+}
+
+const ATTACHMENTS = '[aria-label="Reading Pane"] [role=listbox][aria-label="file attachments"] [role=option]';
+
+async function attachmentNames(p) {
+  return p.locator(ATTACHMENTS).evaluateAll(es => es.map(e => {
+    const name = e.querySelector('[title]')?.getAttribute('title') || e.innerText.split('\n')[0];
+    const size = (e.innerText.match(/[\d.,]+ (?:bytes|KB|MB|GB)/) || [''])[0];
+    return { name: name.trim(), size };
+  }));
+}
+
+async function attachmentMenu(p, index, item) {
+  const opt = p.locator(ATTACHMENTS).nth(index);
+  await opt.scrollIntoViewIfNeeded().catch(() => {});
+  await opt.hover();
+  await opt.locator('button[aria-label="More actions"]').click();
+  await p.waitForTimeout(900);
+  await p.getByRole('menuitem').filter({ hasText: new RegExp('^[\\s\\uE000-\\uF8FF]*' + item, 'i') }).first().click();
+}
+
 const server = new McpServer({ name: 'outlook-web', version: '0.1.0' }, {
   instructions: [
     'Outlook on the web through a signed-in browser. Folder names come from outlook_folders; conversation ids from outlook_list or outlook_search.',
@@ -546,6 +584,72 @@ server.registerTool('outlook_discard_draft', {
   return (await p.locator(`[role=option][data-convid="${id}"]`).filter({ hasText: expected_subject }).count()) ? 'Still in Drafts.' : 'Discarded.';
 }));
 
+
+server.registerTool('outlook_attachments', {
+  description: 'List the attachments in a conversation (every message in the thread), or download them. Give folder+id, or search+id for a conversation found with outlook_search (pass the same query). action "download" saves files to a local folder; "save_to_onedrive" uses Outlook\'s Save to OneDrive (it lands in OneDrive/Attachments). `names` limits it to attachments whose name contains any of the given strings.',
+  inputSchema: {
+    id: z.string(), folder: z.string().optional(), search: z.string().optional(),
+    action: z.enum(['list', 'download', 'save_to_onedrive']).default('list'),
+    names: z.array(z.string()).default([]),
+    dest: z.string().optional().describe('Download folder (default: OUTLOOK_DOWNLOAD_DIR)'),
+  },
+}, tool(async ({ id, folder, search, action, names, dest }) => {
+  const p = await page(); await openTarget(p, { folder, id, search });
+  const all = await attachmentNames(p);
+  if (!all.length) return 'No attachments in this conversation.';
+  const pick = all.map((a, i) => ({ ...a, i })).filter(a => !names.length || names.some(n => a.name.toLowerCase().includes(n.toLowerCase())));
+  if (action === 'list') return all.map(a => `${a.name} (${a.size})`).join('\n');
+  if (!pick.length) return 'None of the attachments match: ' + all.map(a => a.name).join(', ');
+  const out = [];
+  if (action === 'save_to_onedrive') {
+    for (const a of pick) { await attachmentMenu(p, a.i, 'Save to OneDrive'); await p.waitForTimeout(3000); await clearOverlays(p); out.push(`${a.name}: sent to OneDrive (Attachments folder)`); }
+    return out.join('\n');
+  }
+  const dir = path.resolve(dest || DOWNLOAD_DIR);
+  fs.mkdirSync(dir, { recursive: true });
+  const cdp = await p.context().newCDPSession(p);
+  await cdp.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: dir, eventsEnabled: true });
+  try {
+    for (const a of pick) {
+      const done = new Promise(r => { const h = e => { if (e.state !== 'inProgress') { cdp.off('Browser.downloadProgress', h); r(e.state); } }; cdp.on('Browser.downloadProgress', h); });
+      const named = new Promise(r => cdp.once('Browser.downloadWillBegin', e => r(e.suggestedFilename)));
+      await attachmentMenu(p, a.i, 'Download');
+      const state = await Promise.race([done, new Promise(r => setTimeout(() => r('timed out'), 120000))]);
+      const file = await Promise.race([named, new Promise(r => setTimeout(() => r(a.name), 100))]);
+      out.push(state === 'completed' ? path.join(dir, file) : `${a.name}: download ${state}`);
+    }
+  } finally {
+    await cdp.send('Browser.setDownloadBehavior', { behavior: 'default' }).catch(() => {});
+  }
+  return out.join('\n');
+}));
+
+server.registerTool('outlook_people', {
+  description: 'Look people up in your contacts and the organisation directory (name, email or part of either). Returns name, job title, email addresses and phone.',
+  inputSchema: { query: z.string(), limit: z.number().int().min(1).max(50).default(10) },
+}, tool(async ({ query, limit }) => {
+  const p = await page();
+  const pp = await p.context().newPage();
+  try {
+    await pp.goto(BASE + '/people/');
+    await pp.locator('#topSearchInput').waitFor({ timeout: 30000 });
+    await pp.waitForTimeout(1500); await clearOverlays(pp);
+    const box = pp.locator('#topSearchInput');
+    await box.click(); await box.fill(query); await pp.keyboard.press('Enter');
+    await pp.locator('[data-tid=contacts-list-grid-row]').first().waitFor({ timeout: 15000 }).catch(() => {});
+    await pp.waitForTimeout(1500);
+    const rows = await pp.locator('[data-tid=contacts-list-grid-row]').evaluateAll(es => es.map(e =>
+      e.innerText.replace(/[\uE000-\uF8FF]/g, '').split('\n').map(x => x.trim()).filter(x => x && x !== '•')));
+    if (!rows.length) return 'No one found.';
+    const isPhone = x => /^[+\d][\d ()-]{3,}$/.test(x);
+    return rows.slice(0, limit).map(r => {
+      if (/^[A-Z]{1,3}$/.test(r[0])) r = r.slice(1);          // avatar initials
+      const [name, ...rest] = r;
+      return [name, rest.filter(x => !/@/.test(x) && !isPhone(x)).join('; '), rest.filter(x => /@/.test(x)).join(', '), rest.filter(isPhone).join(', ')].filter(Boolean).join(' | ');
+    }).join('\n');
+  } finally { await pp.close().catch(() => {}); }
+}));
+
 server.registerTool('outlook_calendar', {
   description: 'Calendar events from start_date (YYYY-MM-DD, default today) for `days` days, grouped by day: title, time, location, organiser and response as Outlook shows them.',
   inputSchema: { start_date: z.string().optional(), days: z.number().int().min(1).max(31).default(1) },
@@ -556,14 +660,21 @@ server.registerTool('outlook_calendar', {
   const want = [];
   for (let i = 0; i < days; i++) { const d = new Date(start); d.setDate(d.getDate() + i); want.push(fmt(d)); }
   const seen = new Map();
-  const cp = await (await page()).context().newPage();
-  await (await cp.context().newCDPSession(cp)).send('Emulation.setTimezoneOverride', { timezoneId: TIMEZONE }).catch(() => {});
+  const cp = await calendarTab();
   try {
     for (let i = 0; i < days; i += 7) {
       const d = new Date(start); d.setDate(d.getDate() + i);
-      await cp.goto(`${BASE}/calendar/view/week/${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`);
-      await cp.waitForTimeout(7000);
-      for (const l of await cp.evaluate(() => [...document.querySelectorAll('[role=button][aria-label]')].map(e => e.getAttribute('aria-label')))) {
+      await gotoDate(cp, `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`);
+      for (const l of await cp.evaluate(() => [...document.querySelectorAll('[role=button][aria-label]')].map(e => e.getAttribute('aria-label').replace(/ 0(\d), (\d{4})/, ' $1, $2')))) {
+        const day = want.find(w => l.includes(w));
+        if (day && /\d{1,2}:\d\d|all day/i.test(l)) seen.set(l, day);
+      }
+    }
+    // a range that crosses into a week not visited (e.g. starts on Sunday) needs the next week too
+    const last = new Date(start); last.setDate(last.getDate() + days - 1);
+    if (!want.every(w => [...seen.values()].includes(w)) && days > 1) {
+      await gotoDate(cp, `${last.getFullYear()}-${String(last.getMonth() + 1).padStart(2, '0')}-${String(last.getDate()).padStart(2, '0')}`);
+      for (const l of await cp.evaluate(() => [...document.querySelectorAll('[role=button][aria-label]')].map(e => e.getAttribute('aria-label').replace(/ 0(\d), (\d{4})/, ' $1, $2')))) {
         const day = want.find(w => l.includes(w));
         if (day && /\d{1,2}:\d\d|all day/i.test(l)) seen.set(l, day);
       }
@@ -572,6 +683,188 @@ server.registerTool('outlook_calendar', {
   const byDay = {};
   for (const [l, d] of seen) (byDay[d] ||= []).push(l.replace(', ' + d, ''));
   return Object.keys(byDay).length ? byDay : 'No events found.';
+}));
+
+
+// ---- Calendar: events are found by date + title in the day view, then opened in the event view.
+
+async function calendarTab() {
+  const cp = await (await page()).context().newPage();
+  await (await cp.context().newCDPSession(cp)).send('Emulation.setTimezoneOverride', { timezoneId: TIMEZONE }).catch(() => {});
+  return cp;
+}
+
+async function openEvent(cp, date, title) {
+  const [y, m, d] = date.split('-').map(Number);
+  await gotoDate(cp, date);
+  const day = new Date(y, m - 1, d).toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' });
+  const items = cp.locator('[role=button][aria-label]').filter({ hasText: new RegExp(title.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'), 'i') });
+  const labels = await items.evaluateAll((es, day) => es.map(e => e.getAttribute('aria-label')).filter(l => l.replace(/ 0(\d), (\d{4})/, ' $1, $2').includes(day)), day);
+  if (!labels.length) throw new Error(`No event matching "${title}" on ${date}. Use outlook_calendar to see that day.`);
+  if (labels.length > 1) throw new Error(`Several events match "${title}" on ${date}: ${labels.join(' / ')}. Use a more specific title.`);
+  await cp.locator(`[role=button][aria-label="${labels[0].replace(/"/g, '\\"')}"]`).first().click();
+  await cp.waitForTimeout(1500);
+  await cp.getByRole('button', { name: 'View event', exact: true }).click();
+  // the event window's dialog wrapper reports as hidden; wait for one of its buttons instead
+  await cp.getByRole('button', { name: 'Open in new window' }).last().waitFor({ timeout: 15000 });
+  const dlg = cp.locator('[role=dialog]').filter({ has: cp.getByRole('button', { name: 'Open in new window' }) }).last();
+  await cp.waitForTimeout(2000);
+  return dlg;
+}
+
+
+// The calendar ignores dates in the URL, so navigate with the mini calendar: page to the month,
+// then click the day; the main view (week) moves to the week holding that day.
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+async function gotoDate(cp, date) {
+  const [y, m, d] = date.split('-').map(Number);
+  if (!/\/calendar\/view\/week/.test(cp.url())) await cp.goto(`${BASE}/calendar/view/week`);
+  const header = cp.getByRole('button', { name: /select to change the month/ }).first();
+  await header.waitFor({ timeout: 30000 });
+  await cp.waitForTimeout(1500); await clearOverlays(cp);
+  const dayBtn = cp.getByRole('button', { name: `${d}, ${MONTHS[m - 1]}, ${y}`, exact: true }).first();
+  for (let i = 0; i < 48 && !(await dayBtn.isVisible().catch(() => false)); i++) {
+    const shown = (await header.getAttribute('aria-label')).match(/(\d{4}) (\w+)/);
+    const diff = (y - +shown[1]) * 12 + (m - 1 - MONTHS.indexOf(shown[2]));
+    // the two unlabelled buttons after the month title are previous and next month
+    const arrows = header.locator('xpath=following::button[normalize-space(@aria-label)="" or not(@aria-label)]');
+    await arrows.nth(diff < 0 ? 0 : 1).click();
+    await cp.waitForTimeout(500);
+  }
+  await dayBtn.click();
+  await cp.waitForTimeout(2500);
+}
+
+const RESPONSE = { accept: 'Accept', tentative: 'Tentative', decline: 'Decline' };
+
+server.registerTool('outlook_event', {
+  description: 'Open a calendar event by date (YYYY-MM-DD) and part of its title: organiser, attendees and their responses, time, location, Teams link, your response and the description.',
+  inputSchema: { date: z.string(), title: z.string(), max_chars: z.number().int().default(5000) },
+}, tool(async ({ date, title, max_chars }) => {
+  const cp = await calendarTab();
+  try {
+    const dlg = await openEvent(cp, date, title);
+    const t = await dlg.innerText();
+    return t.replace(/[\uE000-\uF8FF]/g, '').replace(/[ \t\u00a0]+\n/g, '\n').replace(/\n{2,}/g, '\n').slice(0, max_chars);
+  } finally { await cp.close().catch(() => {}); }
+}));
+
+server.registerTool('outlook_event_respond', {
+  description: 'Accept, tentatively accept or decline a meeting invitation, optionally with a note to the organiser. This emails the organiser: only call it after the user has said how to respond to this specific invitation. Disabled unless OUTLOOK_ENABLE_SEND=1.',
+  inputSchema: { date: z.string(), title: z.string(), response: z.enum(['accept', 'tentative', 'decline']), note: z.string().default('') },
+}, tool(async ({ date, title, response, note }) => {
+  if (!SEND_ENABLED) throw new Error('Responding to invitations is disabled (it emails the organiser). Start the server with OUTLOOK_ENABLE_SEND=1.');
+  const cp = await calendarTab();
+  try {
+    const dlg = await openEvent(cp, date, title);
+    const word = RESPONSE[response];
+    // Already responded: the response buttons are folded into a menu named after the current response.
+    const menuBtn = dlg.locator('button[aria-haspopup=menu]').filter({ hasText: /Accepted|Tentative|Declined/ }).first();
+    const hasMenu = await menuBtn.isVisible().catch(() => false);
+    if (note) {
+      const direct = dlg.getByRole('button', { name: 'RSVP with note', exact: true });
+      if (await direct.isVisible().catch(() => false)) await direct.click();
+      else { await menuBtn.click(); await cp.waitForTimeout(800); await cp.getByRole('menuitem', { name: 'RSVP with note', exact: true }).click(); }
+      const rsvp = cp.getByRole('dialog').filter({ hasText: 'RSVP to' }).last();
+      await rsvp.waitFor({ timeout: 10000 });
+      await rsvp.locator('textarea, [contenteditable=true]').first().fill(note);
+      await rsvp.getByRole('combobox', { name: 'Select an option' }).click(); await cp.waitForTimeout(700);
+      await cp.getByRole('option', { name: word, exact: true }).click(); await cp.waitForTimeout(500);
+      await rsvp.getByRole('button', { name: 'Confirm', exact: true }).click();
+    } else if (hasMenu) {
+      if ((await menuBtn.innerText()).includes(word === 'Accept' ? 'Accepted' : word === 'Decline' ? 'Declined' : 'Tentative')) return `Already ${response === 'accept' ? 'accepted' : response === 'decline' ? 'declined' : 'tentative'}; nothing sent.`;
+      await menuBtn.click(); await cp.waitForTimeout(800);
+      await cp.getByRole('menuitem', { name: word, exact: true }).click();
+    } else {
+      await dlg.getByRole('button', { name: word, exact: true }).click();
+    }
+    await cp.waitForTimeout(3000);
+    const ask = cp.locator('[role=alertdialog], [role=dialog][aria-modal=true]').filter({ hasNotText: title }).filter({ visible: true });
+    if (await ask.count()) { const msg = (await ask.first().innerText()).replace(/\s+/g, ' ').slice(0, 300); await clearOverlays(cp); throw new Error(`Outlook asked something and it was cancelled: "${msg}". Check the event with outlook_event.`); }
+    return `Responded: ${word}${note ? ' (with note)' : ''}.`;
+  } finally { await cp.close().catch(() => {}); }
+}));
+
+server.registerTool('outlook_event_create', {
+  description: 'Create a calendar event: title, date (YYYY-MM-DD), start and end (HH:MM, 24-hour) or all_day, location, optional Microsoft Teams meeting, description. With no attendees it is just saved in the calendar. With attendees it sends them invitations: only after the user has approved this event and its invite list (needs OUTLOOK_ENABLE_SEND=1). Same-day events only.',
+  inputSchema: {
+    title: z.string(), date: z.string(), start: z.string().optional(), end: z.string().optional(), all_day: z.boolean().default(false),
+    location: z.string().default(''), teams: z.boolean().default(false), attendees: z.array(z.string()).default([]), body: z.string().default(''),
+  },
+}, tool(async ({ title, date, start, end, all_day, location, teams, attendees, body }) => {
+  if (attendees.length && !SEND_ENABLED) throw new Error('Inviting attendees sends email, which is disabled. Start the server with OUTLOOK_ENABLE_SEND=1, or create the event without attendees.');
+  if (!all_day && !(start && end)) throw new Error('Give start and end (HH:MM), or all_day: true.');
+  const cp = await calendarTab();
+  try {
+    await cp.goto(`${BASE}/calendar/view/week`);
+    await cp.getByRole('button', { name: 'New event', exact: true }).first().waitFor({ timeout: 30000 });
+    await cp.waitForTimeout(2000); await clearOverlays(cp);
+    await cp.getByRole('button', { name: 'New event', exact: true }).first().click();
+    // the form's dialog wrapper reports as hidden, so work from the page (only one form is open)
+    const form = cp.locator('body');
+    await cp.locator('input[placeholder="Add title"]').waitFor({ timeout: 15000 });
+    await form.locator('input[placeholder="Add title"]').fill(title);
+    if (attendees.length) {
+      await form.locator('[aria-label="Invite required attendees"]').click();
+      for (const a of attendees) { await cp.keyboard.insertText(a); await cp.waitForTimeout(900); await cp.keyboard.press(';'); await cp.waitForTimeout(400); }
+    }
+    // the date/time summary opens the start date, start time, end time and all-day fields
+    await form.getByText(/\d{4}-\d\d-\d\d \d\d:\d\d - /).first().click();
+    const setField = async (name, value) => {
+      const f = form.getByRole('combobox', { name, exact: true });
+      await f.click(); await f.fill(value); await cp.keyboard.press('Enter'); await cp.waitForTimeout(500);
+    };
+    await setField('Start date', date);
+    if (all_day) { const ad = form.getByRole('checkbox', { name: 'All day' }); if (!(await ad.isChecked())) await ad.check(); }
+    else { await setField('Start time', start); await setField('End time', end); }
+    await cp.locator('input[placeholder="Add title"]').click();     // closes the date/time panel
+    await cp.waitForTimeout(800);
+    if (location) {
+      const loc = cp.locator('input[aria-label="Add a room or location"]');
+      await loc.click(); await loc.fill(location); await cp.waitForTimeout(800); await cp.keyboard.press('Tab');
+    }
+    if (teams) { const sw = form.getByRole('switch', { name: /Microsoft Teams meeting/ }); if (!(await sw.isChecked())) await sw.click(); }
+    if (body) { const b = form.getByRole('textbox', { name: 'Event body' }); await b.click(); await cp.keyboard.insertText(body); }
+    await cp.waitForTimeout(1000);
+    const summary = (await cp.locator('[role=dialog]').filter({ has: cp.locator('input[placeholder="Add title"]') }).last().innerText().catch(() => '')).replace(/[\uE000-\uF8FF]/g, '').replace(/\s+/g, ' ').slice(0, 600);
+    const saveName = attendees.length ? 'Send' : 'Save';
+    await form.getByRole('button', { name: saveName, exact: true }).click();
+    await cp.waitForTimeout(4000);
+    const ask = cp.locator('[role=alertdialog], [role=dialog][aria-modal=true]').filter({ visible: true }).filter({ hasNotText: 'Add title' });
+    if (await ask.count()) { const msg = (await ask.first().innerText()).replace(/\s+/g, ' ').slice(0, 300); await clearOverlays(cp); throw new Error(`Outlook asked something and it was cancelled: "${msg}"`); }
+    return `${attendees.length ? 'Sent invitations for' : 'Saved'} "${title}" on ${date}. Form before saving: ${summary}`;
+  } finally { await cp.close().catch(() => {}); }
+}));
+
+server.registerTool('outlook_event_delete', {
+  description: 'Delete an event from the calendar (date + part of its title). For a meeting you organised with attendees this sends them a cancellation: only after the user approves it (needs OUTLOOK_ENABLE_SEND=1). To turn down someone else\'s meeting use outlook_event_respond with decline.',
+  inputSchema: { date: z.string(), title: z.string() },
+}, tool(async ({ date, title }) => {
+  const cp = await calendarTab();
+  try {
+    const dlg = await openEvent(cp, date, title);
+    await cp.getByRole('button', { name: 'Delete', exact: true }).filter({ visible: true }).first().click();
+    await cp.waitForTimeout(1500);
+    // confirmation: "Delete event" (no attendees) or a cancellation to send (meeting you organised)
+    const box = cp.locator('[role=dialog], [role=alertdialog]')
+      .filter({ hasNot: cp.getByRole('button', { name: 'Open in new window' }) })     // not the event window itself
+      .filter({ hasText: /Delete event|Are you sure|cancellation|Cancel meeting/i }).last();
+    const sendBtn = box.getByRole('button', { name: /^Send( cancellation)?$/ });
+    const delBtn = box.getByRole('button', { name: 'Delete', exact: true });
+    if (await sendBtn.count()) {
+      if (!SEND_ENABLED) { await clearOverlays(cp); throw new Error('Deleting this meeting sends a cancellation to its attendees, which is disabled.'); }
+      await sendBtn.last().click();
+    } else if (await delBtn.count()) {
+      await delBtn.last().click();
+    } else {
+      throw new Error('Outlook did not ask to confirm the deletion; check the calendar with outlook_calendar.');
+    }
+    await cp.waitForTimeout(2500);
+    await gotoDate(cp, date);
+    const left = await cp.locator('[role=button][aria-label]').filter({ hasText: new RegExp(title.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'), 'i') }).count();
+    if (left) throw new Error('Outlook still shows the event after deleting; check it with outlook_event.');
+    return 'Deleted.';
+  } finally { await cp.close().catch(() => {}); }
 }));
 
 server.registerTool('browser_screenshot', {

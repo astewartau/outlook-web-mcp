@@ -24,6 +24,18 @@ description: Working rules for the outlook-web MCP tools (Outlook on the web thr
 - Before sending, show the draft with `outlook_read_draft` (recipients, subject, text) unless the user has just read it.
 - Then `outlook_send_draft` with the draft id and part of its subject. If sending is disabled, say so; the user can send it from Outlook.
 
+## Calendar
+
+- `outlook_calendar` for a day or range; `outlook_event` (date + part of the title) for the details.
+- Responding to an invitation (`outlook_event_respond`) emails the organiser: only when the user has said how to answer that invitation. Never "try out" a response.
+- `outlook_event_create` without attendees just adds it to the calendar. With attendees it sends invitations, so confirm the title, time, location, Teams and invite list with the user first. Set `teams: true` for online meetings.
+- `outlook_event_delete` on a meeting the user organised sends a cancellation: ask first.
+
+## Attachments and people
+
+- `outlook_attachments` lists or downloads attachments (`folder`+`id`, or `search`+`id` for search results). Outlook does not copy attachments to OneDrive by itself; `save_to_onedrive` does it on request.
+- `outlook_people` finds email addresses, titles and phone numbers before drafting to someone new.
+
 ## Housekeeping
 
 - `outlook_mark` with `delete` or `archive` only when the user asks. Throw away a mistaken draft with `outlook_discard_draft`.

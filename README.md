@@ -38,10 +38,16 @@ It also works with an ordinary desktop Chrome started with `--remote-debugging-p
 | `outlook_read_draft` | Recipients, subject and text of a draft, to check before sending |
 | `outlook_send_draft` | Sends a draft. **Off unless `OUTLOOK_ENABLE_SEND=1`**; checks the subject and that it has recipients |
 | `outlook_discard_draft` | Throws a draft away |
+| `outlook_attachments` | List a conversation's attachments, download them to a local folder, or Save to OneDrive |
+| `outlook_people` | Look people up in contacts and the organisation directory: name, title, email, phone |
 | `outlook_calendar` | Events for a range of days |
+| `outlook_event` | One event in full: organiser, attendees and responses, location, Teams link, description |
+| `outlook_event_respond` | Accept, tentative or decline an invitation, optionally with a note. **Needs `OUTLOOK_ENABLE_SEND=1`** (it emails the organiser) |
+| `outlook_event_create` | New event: title, date, times or all day, location, Teams meeting, description; attendees get invitations (**needs `OUTLOOK_ENABLE_SEND=1`**) |
+| `outlook_event_delete` | Delete an event; for a meeting you organised, sends the cancellation (**needs `OUTLOOK_ENABLE_SEND=1`**) |
 | `browser_screenshot` | What the Outlook tab looks like right now |
 
-Drafting and sending are separate on purpose: the assistant writes a draft, you read it (in Outlook or through `outlook_read_draft`), and only then is it sent.
+Drafting and sending are separate on purpose: the assistant writes a draft, you read it (in Outlook or through `outlook_read_draft`), and only then is it sent. Everything else that emails other people (invitation responses, invitations, cancellations) is behind the same `OUTLOOK_ENABLE_SEND` switch.
 
 ## Setup (Linux)
 
@@ -80,7 +86,8 @@ claude mcp add -s user outlook-web \
 | `OUTLOOK_URL` | `https://outlook.cloud.microsoft` | Outlook address (`https://outlook.office.com` also works) |
 | `OUTLOOK_ACCOUNT` | | Account to pick on the Microsoft sign-in page |
 | `OUTLOOK_TIMEZONE` | system zone | Defines "today" for `outlook_calendar` |
-| `OUTLOOK_ENABLE_SEND` | off | Allow `outlook_send_draft` |
+| `OUTLOOK_ENABLE_SEND` | off | Allow tools that email other people: sending drafts, invitation responses, invitations, cancellations |
+| `OUTLOOK_DOWNLOAD_DIR` | `~/Downloads/outlook-attachments` | Where attachments are downloaded |
 
 `skills/outlook-email/SKILL.md` is a Claude Code skill with working rules (triage, drafting, when sending is allowed). Copy it to `~/.claude/skills/outlook-email/`.
 
@@ -90,7 +97,8 @@ Test a tool without an MCP client: `node scripts/call.mjs outlook_folders '{}'`.
 
 - It depends on Outlook's page structure (ARIA roles and labels). When Microsoft changes the page, selectors may need updating. It was built against the new Outlook on the web in English (late 2026).
 - One tab and one action at a time; reading a long folder takes seconds, not milliseconds.
-- Calendar is read-only for now.
+- Events are same-day (no multi-day or recurring events yet). The calendar ignores dates in its URL, so the tools page through the mini calendar.
+- `outlook_event_respond` with a note goes through Outlook's "RSVP with note" dialog.
 - If the site ever publishes [WebMCP](https://github.com/webmachinelearning/webmcp) tools, those would be the better route.
 
 ## Licence
