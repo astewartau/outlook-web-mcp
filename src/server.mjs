@@ -50,13 +50,14 @@ async function page() {
   if (tab && !tab.isClosed()) return tab;
   const ctx = browser.contexts()[0];
   for (const p of ctx.pages()) {
-    if (await p.evaluate(n => window.name === n, TAB_NAME).catch(() => false)) { tab = p; break; }
+    // window.name is cleared by the cross-site trip through the sign-in pages; sessionStorage survives it.
+    if (await p.evaluate(n => window.name === n || sessionStorage.getItem(n) === '1', TAB_NAME).catch(() => false)) { tab = p; break; }
   }
   if (!tab) {
     tab = await ctx.newPage();
     await tab.goto(BASE + '/mail/');
   }
-  await tab.evaluate(n => { window.name = n; }, TAB_NAME).catch(() => {});
+  await tab.evaluate(n => { window.name = n; sessionStorage.setItem(n, '1'); }, TAB_NAME).catch(() => {});
   // Outlook compares the browser's time zone with the mailbox's: report the user's zone, so it
   // never offers to move the calendar to the server's zone.
   const cdp = await ctx.newCDPSession(tab);
@@ -65,9 +66,21 @@ async function page() {
   return tab;
 }
 
+// When the session expires Outlook keeps the old page (folder tree and all) and only shows a
+// "You need to sign in / Your session has expired" bar; nothing on the page works after that.
+async function sessionExpired(p) {
+  return p.getByText(/^(You need to sign in\.?|Your session has expired\b.*)$/).first().isVisible().catch(() => false);
+}
+
 async function signedIn(p) {
   if (/login\.microsoftonline|login\.live|okta|adfs|\/saml/i.test(p.url())) return false;
+  if (await sessionExpired(p)) return false;
   return (await p.locator('[role=tree]').count()) > 0 || /\/calendar/.test(p.url());
+}
+
+async function ensureCalendar(cp) {
+  if (/login\.microsoftonline|login\.live|okta|adfs|\/saml/i.test(cp.url()) || await sessionExpired(cp))
+    throw new Error('Not signed in to Outlook (session expired). Call outlook_login.');
 }
 
 // Close the Reminders pop-up (without dismissing reminders): it sits over the page and swallows clicks.
@@ -93,7 +106,7 @@ async function ensureMail(p) {
   if (!/\/mail/.test(p.url()) || !(await signedIn(p))) {
     await p.goto(BASE + '/mail/');
     await p.waitForLoadState('domcontentloaded');
-    await p.evaluate(n => { window.name = n; }, TAB_NAME).catch(() => {});
+    await p.evaluate(n => { window.name = n; sessionStorage.setItem(n, '1'); }, TAB_NAME).catch(() => {});
   }
   await p.locator('[role=tree]').first().waitFor({ timeout: 30000 }).catch(() => {});
   if (!(await signedIn(p))) throw new Error('Not signed in to Outlook. Call outlook_login.');
@@ -248,18 +261,60 @@ async function fillBody(p, body) {
   await clearOverlays(p);
   const ed = p.locator('[contenteditable=true][aria-label*="Message body"], div[role=textbox][aria-label*="Message body"]').first();
   await ed.waitFor({ timeout: 15000 });
+  // Outlook adds the signature (and quoted text) a moment after the form opens, re-rendering the
+  // body; text typed before that is lost. Wait until the body has stopped changing.
+  let last = null;
+  for (let i = 0, same = 0; i < 20 && same < 3; i++) {
+    const now = await ed.innerText().catch(() => '');
+    same = now === last ? same + 1 : 0; last = now;
+    await p.waitForTimeout(500);
+  }
   await ed.click();
   await p.keyboard.press('Control+Home');
   for (const [i, line] of body.split('\n').entries()) {
     if (i) await p.keyboard.press('Enter');
     if (line) await p.keyboard.insertText(line);
   }
+  await p.waitForTimeout(500);
+  const squash = t => t.replace(/[\s\u200b]+/g, ' ').trim();
+  const got = squash(await ed.innerText().catch(() => ''));
+  if (!got.includes(squash(body))) throw new Error('The text did not all reach the message body; the form is left open (Outlook may have autosaved it to Drafts). Use browser_screenshot.');
+}
+
+// A recipient box (To, Cc, Bcc). Outlook has labelled it both "To" and "To recipients".
+const recipientBox = (p, field) => p.locator([`[contenteditable=true]`, `div[role=textbox]`, `input`]
+  .flatMap(t => [`${t}[aria-label="${field}"]`, `${t}[aria-label="${field} recipients"]`]).join(', ')).filter({ visible: true }).first();
+
+// Wait until an opened compose form can take input; explain why if it never does.
+async function waitForCompose(p) {
+  const ready = p.locator('[contenteditable=true][aria-label*="Message body"], div[role=textbox][aria-label*="Message body"]').filter({ visible: true }).first();
+  for (let i = 0; i < 40; i++) {
+    if (await ready.isVisible().catch(() => false)) return;
+    if (await sessionExpired(p)) throw new Error('Not signed in to Outlook (session expired). Call outlook_login.');
+    await p.waitForTimeout(500);
+  }
+  throw new Error('The compose form did not open (no message body field). Use browser_screenshot.');
+}
+
+// Open a new, empty compose form. Starts from a fresh mail view so a half-open compose pane left by
+// an earlier failed call (or the compose ribbon, which has no New mail button) can't get in the way.
+async function openNewCompose(p) {
+  await p.goto(BASE + '/mail/');
+  await p.evaluate(n => { window.name = n; sessionStorage.setItem(n, '1'); }, TAB_NAME).catch(() => {});
+  await ensureMail(p);
+  const home = p.getByRole('tab', { name: 'Home', exact: true }).first();
+  if (await home.isVisible().catch(() => false) && (await home.getAttribute('aria-selected')) !== 'true') { await home.click(); await p.waitForTimeout(500); }
+  const btn = p.getByRole('button', { name: /^New (mail|message|email)$/ }).filter({ visible: true }).first();
+  await btn.waitFor({ timeout: 15000 }).catch(() => { throw new Error('No "New mail" button on the Home tab. Use browser_screenshot.'); });
+  await btn.click();
+  await waitForCompose(p);
 }
 
 async function addRecipients(p, field, list) {
   if (!list.length) return;
-  const box = p.locator(`[contenteditable=true][aria-label="${field}"], div[role=textbox][aria-label="${field}"], input[aria-label="${field}"]`).first();
-  if (!(await box.isVisible().catch(() => false))) await p.getByRole('button', { name: new RegExp('^' + field + '$') }).first().click().catch(() => {});
+  const box = recipientBox(p, field);
+  if (!(await box.isVisible().catch(() => false))) await p.getByRole('button', { name: new RegExp('^(Show )?' + field + '$') }).filter({ visible: true }).first().click().catch(() => {});
+  await box.waitFor({ timeout: 10000 }).catch(() => { throw new Error(`The ${field} field of the compose form was not found. Use browser_screenshot.`); });
   await box.click();
   for (const a of list) { await p.keyboard.insertText(a); await p.waitForTimeout(800); await p.keyboard.press(';'); await p.waitForTimeout(400); }
 }
@@ -292,6 +347,7 @@ async function openDraftForEdit(p, id) {
   const editor = p.locator('[contenteditable=true][aria-label*="Message body"]').first();
   const edit = p.getByRole('button', { name: /^(Edit|Continue editing)/ }).filter({ visible: true }).first();
   for (let i = 0; i < 20 && !(await editor.isVisible().catch(() => false)); i++) {
+    if (await sessionExpired(p)) throw new Error('Not signed in to Outlook (session expired). Call outlook_login.');
     if (await edit.isVisible().catch(() => false)) await edit.click();
     await p.waitForTimeout(700);
   }
@@ -302,7 +358,7 @@ async function openDraftForEdit(p, id) {
 async function composeSummary(p, max = 6000) {
   return p.evaluate(max => {
     const field = f => {
-      const el = document.querySelector(`[contenteditable=true][aria-label="${f}"]`);
+      const el = document.querySelector(`[contenteditable=true][aria-label="${f}"], [contenteditable=true][aria-label="${f} recipients"]`);
       let box = el; for (let i = 0; i < 3 && box && !box.innerText.trim(); i++) box = box.parentElement;
       const t = (box?.innerText || '').replace(/[\u200b\s]+/g, ' ').trim();
       return t ? `${f}: ${t}` : '';
@@ -377,16 +433,31 @@ server.registerTool('outlook_login', {
   const deadline = Date.now() + Math.max(wait_seconds, 25) * 1000;
   while (Date.now() < deadline) {
     if (await signedIn(p)) return 'Signed in.';
-    if (ACCOUNT) {
-      const acct = p.getByText(ACCOUNT).first();
-      if (/login\.microsoftonline/.test(p.url()) && await acct.isVisible().catch(() => false)) { await acct.click(); await p.waitForTimeout(3000); continue; }
+    // Account picker: take OUTLOOK_ACCOUNT, or the only account listed (the picker may show the
+    // username form, e.g. uqxxxxx@uq.edu.au, rather than the email address).
+    if (/login\.microsoftonline/.test(p.url()) && /Pick an account/i.test(await p.evaluate(() => document.body.innerText).catch(() => ''))) {
+      const tiles = p.getByText(/^[^\s@]+@[^\s@]+\.[^\s@]+$/).filter({ visible: true });
+      const want = ACCOUNT ? tiles.filter({ hasText: ACCOUNT }) : tiles;
+      const pick = (await want.count()) ? want.first() : (await tiles.count()) === 1 ? tiles.first() : null;
+      if (pick) { await pick.click(); await p.waitForTimeout(3000); continue; }
+      return 'The Microsoft sign-in page asks which account to use and none matches OUTLOOK_ACCOUNT. The user needs to pick it in the browser.';
     }
     const body = await p.evaluate(() => document.body.innerText).catch(() => '');
     const num = body.match(/(?:tap|select|enter|number)[^\n]{0,80}?\b(\d{2,3})\b/i) || body.match(/\n\s*(\d{2,3})\s*\n/);
-    if (num && /okta|login\.microsoftonline/i.test(p.url()) && /verify|approve|authenticator|okta/i.test(body)) {
+    // (Okta can be on the organisation's own domain, e.g. signin.uq.edu.au, so don't rely on the URL.)
+    if (num && !/outlook\./i.test(p.url()) && /verify|approve|authenticator|okta/i.test(body)) {
       if (!wait_seconds) return `Approval requested: the user should tap or enter ${num[1]} in their authenticator app. Then call outlook_login with wait_seconds=60.`;
       await p.waitForTimeout(3000); continue;
     }
+    // Okta may default to typing a code from Okta Verify: switch to a push (number matching) instead.
+    const codeBox = p.locator('input[name="credentials.totp"], input[name="credentials.passcode"], input[name=passcode]').filter({ visible: true }).first();
+    if (await codeBox.count() && /Enter a code/i.test(body)) {
+      const other = p.getByRole('link', { name: /Verify with something else/i }).or(p.getByRole('button', { name: /Verify with something else/i })).first();
+      if (await other.isVisible().catch(() => false)) { await other.click(); await p.waitForTimeout(3000); continue; }
+      return 'Okta asks for a code from Okta Verify and offers no push option. The user needs to sign in in the browser.';
+    }
+    const pushOption = p.getByRole('link', { name: /^Select Get a push notification/i }).or(p.getByRole('button', { name: /^Select Get a push notification/i })).first();
+    if (await pushOption.isVisible().catch(() => false)) { await pushOption.click(); await p.waitForTimeout(3000); continue; }
     const push = p.getByRole('link', { name: /push notification|okta verify/i }).or(p.getByRole('button', { name: /send push|push notification/i })).first();
     if (await push.isVisible().catch(() => false)) { await push.click(); await p.waitForTimeout(3000); continue; }
     const pw = p.locator('input[type=password]').first();
@@ -398,7 +469,10 @@ server.registerTool('outlook_login', {
     const user = p.locator('input[name=identifier], input[name=username], input[name=loginfmt], input[type=email]').first();
     if (await user.isVisible().catch(() => false)) {
       if (!(await user.inputValue())) { if (!ACCOUNT) return 'The sign-in page asks for a username. Set OUTLOOK_ACCOUNT or sign in in the browser.'; await user.fill(ACCOUNT); }
-      await p.keyboard.press('Enter'); await p.waitForTimeout(4000); continue;
+      // Submit from the field itself (Enter with focus elsewhere does nothing), or its Next button.
+      await user.focus(); await user.press('Enter'); await p.waitForTimeout(4000);
+      if (await user.isVisible().catch(() => false)) { const nx = p.locator('input[type=submit][value="Next"], button[type=submit]').filter({ visible: true }).first(); if (await nx.count()) { await nx.click(); await p.waitForTimeout(4000); } }
+      continue;
     }
     const next = p.getByRole('button', { name: /^(Yes|Next|Verify|Sign in|Continue)$/ }).first();
     if (await next.isVisible().catch(() => false)) { await next.click(); await p.waitForTimeout(3000); continue; }
@@ -508,7 +582,7 @@ server.registerTool('outlook_draft_reply', {
   await p.waitForTimeout(1500); await clearOverlays(p);
   const name = { reply: /^Reply$/, reply_all: /^Reply all$/, forward: /^Forward$/ }[mode];
   await p.getByRole('button', { name }).filter({ visible: true }).last().click();
-  await p.waitForTimeout(2000);
+  await waitForCompose(p);
   await addRecipients(p, 'To', to);
   await addRecipients(p, 'Cc', cc);
   await fillBody(p, body);
@@ -521,13 +595,11 @@ server.registerTool('outlook_draft_new', {
   description: 'Write a new email and save it as a draft (does not send). to/cc/bcc are lists of email addresses. Returns the draft id for outlook_send_draft.',
   inputSchema: { to: z.array(z.string()).default([]), cc: z.array(z.string()).default([]), bcc: z.array(z.string()).default([]), subject: z.string(), body: z.string() },
 }, tool(async ({ to, cc, bcc, subject, body }) => {
-  const p = await page(); await ensureMail(p);
-  await p.getByRole('button', { name: /^New mail$/ }).first().click();
-  await p.waitForTimeout(2500);
+  const p = await page(); await openNewCompose(p);
   await addRecipients(p, 'To', to);
   await addRecipients(p, 'Cc', cc);
   await addRecipients(p, 'Bcc', bcc);
-  const subj = p.locator('input[aria-label="Subject"], input[placeholder="Add a subject"]').first();
+  const subj = p.locator('input[aria-label="Subject"], input[aria-label="Add a subject"], input[placeholder="Add a subject"]').filter({ visible: true }).first();
   await subj.click(); await subj.fill(subject);
   await fillBody(p, body);
   await saveDraft(p);
@@ -719,6 +791,7 @@ const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 
 async function gotoDate(cp, date) {
   const [y, m, d] = date.split('-').map(Number);
   if (!/\/calendar\/view\/week/.test(cp.url())) await cp.goto(`${BASE}/calendar/view/week`);
+  await cp.waitForTimeout(1000); await ensureCalendar(cp);
   const header = cp.getByRole('button', { name: /select to change the month/ }).first();
   await header.waitFor({ timeout: 30000 });
   await cp.waitForTimeout(1500); await clearOverlays(cp);
@@ -797,6 +870,7 @@ server.registerTool('outlook_event_create', {
   const cp = await calendarTab();
   try {
     await cp.goto(`${BASE}/calendar/view/week`);
+    await cp.waitForTimeout(1000); await ensureCalendar(cp);
     await cp.getByRole('button', { name: 'New event', exact: true }).first().waitFor({ timeout: 30000 });
     await cp.waitForTimeout(2000); await clearOverlays(cp);
     await cp.getByRole('button', { name: 'New event', exact: true }).first().click();
