@@ -581,7 +581,11 @@ server.registerTool('outlook_draft_reply', {
   const p = await page(); await openConversation(p, folder, id, true);
   await p.waitForTimeout(1500); await clearOverlays(p);
   const name = { reply: /^Reply$/, reply_all: /^Reply all$/, forward: /^Forward$/ }[mode];
-  await p.getByRole('button', { name }).filter({ visible: true }).last().click();
+  // The ribbon button can be disabled while the reading pane's own buttons work, so take an enabled one.
+  const btn = p.getByRole('button', { name }).filter({ visible: true })
+    .and(p.locator(':not([aria-disabled="true"]):not([disabled])')).last();
+  await btn.waitFor({ timeout: 10000 }).catch(() => { throw new Error(`No enabled "${mode}" button for this conversation.`); });
+  await btn.click();
   await waitForCompose(p);
   await addRecipients(p, 'To', to);
   await addRecipients(p, 'Cc', cc);
@@ -653,7 +657,10 @@ server.registerTool('outlook_discard_draft', {
   if (await ok.count()) await ok.first().click();
   await p.waitForTimeout(2500);
   await openFolder(p, 'Drafts');
-  return (await p.locator(`[role=option][data-convid="${id}"]`).filter({ hasText: expected_subject }).count()) ? 'Still in Drafts.' : 'Discarded.';
+  // The list can lag behind the discard; give it a few seconds before saying it failed.
+  const left = p.locator(`[role=option][data-convid="${id}"]`).filter({ hasText: expected_subject });
+  for (let i = 0; i < 5 && await left.count(); i++) await p.waitForTimeout(2000);
+  return (await left.count()) ? 'Still in Drafts.' : 'Discarded.';
 }));
 
 
