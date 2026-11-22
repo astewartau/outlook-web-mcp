@@ -1,6 +1,6 @@
 ---
 name: outlook-email
-description: Working rules for the outlook-web MCP tools (Outlook on the web through a signed-in browser). Use when reading, triaging, drafting, replying to or sending work email, or checking the work calendar.
+description: Working rules for the outlook-web MCP tools (Outlook on the web through a signed-in browser). Use when reading, triaging, drafting, replying to or sending work email, or checking the work calendar, and signing back in (Okta or Microsoft MFA) when the Outlook session expires.
 ---
 
 # Outlook email through outlook-web-mcp
@@ -31,6 +31,18 @@ description: Working rules for the outlook-web MCP tools (Outlook on the web thr
 - `outlook_event_create` without attendees just adds it to the calendar. With attendees it sends invitations, so confirm the title, time, location, Teams and invite list with the user first. Set `teams: true` for online meetings.
 - `outlook_event_delete` on a meeting the user organised sends a cancellation: ask first.
 
+## Signing in
+
+Outlook sessions expire every so often. An expired page still looks normal apart from a red "You need to sign in. Your session has expired" bar, and nothing on it works.
+
+1. **Spotting it:** a tool says "Not signed in" or "session expired", or `outlook_status` shows `signed_in: false`. If tools time out while status says signed in, take a `browser_screenshot` and look for the red bar.
+2. **Start the sign-in:** call `outlook_login` (no `wait_seconds`). It uses the password saved in the browser and handles the account picker. The picker may show the account's username form (e.g. `uqxxxxx@uni.edu.au`) rather than the email address; that is the same account. It also switches an Okta "Enter a code" page to a push, then returns a number.
+3. **Relay the number at once:** tell the user to tap or enter that number in their authenticator app (Okta Verify or Microsoft Authenticator). A worker agent sends it to whoever it reports to instead.
+4. **Wait for approval:** call `outlook_login` with `wait_seconds: 90`. It returns "Signed in." once approved.
+5. **Don't restart the sign-in over and over:** each fresh attempt can send a new push, which voids the old number. If it times out, ask the user whether they saw the prompt before starting again.
+6. **If it returns "Stopped at …":** retry once, then send the user a `browser_screenshot` and say where it stopped. Never drive the sign-in pages with general browser tools, type MFA codes, or read the saved password. The user can sign in themselves through the browser's remote viewer.
+7. **After signing in:** retry the tool that failed. A compose call that failed may have left a half-written draft, so check `Drafts` and remove a mistaken one with `outlook_discard_draft`.
+
 ## Attachments and people
 
 - `outlook_attachments` lists or downloads attachments (`folder`+`id`, or `search`+`id` for search results). Outlook does not copy attachments to OneDrive by itself; `save_to_onedrive` does it on request.
@@ -39,7 +51,6 @@ description: Working rules for the outlook-web MCP tools (Outlook on the web thr
 ## Housekeeping
 
 - `outlook_mark` with `delete` or `archive` only when the user asks. Throw away a mistaken draft with `outlook_discard_draft`.
-- If a tool says the session expired, call `outlook_login` and pass the number it returns to the user to approve in their authenticator app, then call it again with `wait_seconds: 60`.
 - If something looks wrong, `browser_screenshot` shows the page.
 
 ## When a tool fails
