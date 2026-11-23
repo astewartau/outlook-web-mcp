@@ -29,13 +29,14 @@ It also works with an ordinary desktop Chrome started with `--remote-debugging-p
 | `outlook_login` | Signs in again with the browser's saved password (autofill; never read) and returns the MFA number to approve (Okta Verify or Microsoft Authenticator number matching) |
 | `outlook_folders` | Folder tree with unread and item counts |
 | `outlook_list` | Conversations in a folder: pinned ones separately, then the newest `limit`; filter by unread or by text |
-| `outlook_read` | A whole conversation by id (marks it read unless asked not to) |
+| `outlook_read` | A whole conversation by id, with each link's address after its text (marks it read unless asked not to) |
 | `outlook_read_unread` | Every unread conversation in one folder or in all folders, marking each read |
 | `outlook_search` / `outlook_read_search_result` | Outlook search (`from:`, `subject:` …) and opening a result |
 | `outlook_mark` | Read, unread, flag, unflag, pin, unpin, archive, delete |
-| `outlook_draft_reply` | Reply, reply-all or forward, saved as a draft |
-| `outlook_draft_new` | New email saved as a draft |
-| `outlook_read_draft` | Recipients, subject and text of a draft, to check before sending |
+| `outlook_draft_reply` | Reply, reply-all or forward, saved as a draft, with optional attachments. Stops if the conversation already has a draft, unless told to replace that draft's text |
+| `outlook_draft_new` | New email saved as a draft, with optional attachments |
+| `outlook_edit_draft` | Change a draft: replace its text (signature and quoted thread stay), recipients or subject, add attachments |
+| `outlook_read_draft` | Recipients, subject, attachment names and text of a draft, to check before sending |
 | `outlook_send_draft` | Sends a draft. **Off unless `OUTLOOK_ENABLE_SEND=1`**; checks the subject and that it has recipients |
 | `outlook_discard_draft` | Throws a draft away |
 | `outlook_attachments` | List a conversation's attachments, download them to a local folder, or Save to OneDrive |

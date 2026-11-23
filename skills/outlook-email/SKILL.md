@@ -11,12 +11,17 @@ description: Working rules for the outlook-web MCP tools (Outlook on the web thr
 2. `outlook_read_unread` (no folder) reads all of it and marks it read. For a big backlog, go folder by folder.
 3. To find something, use `outlook_search` (`from:name`, `subject:words`) or `outlook_list` with `match`. Pinned conversations are listed separately and don't use up `limit`.
 4. Report what needs action, by date, and leave newsletters and notifications out unless asked.
+5. Read output shows links as `text <url>`. Pass a link on to the user when they need to act on it (verification, sign-up, forms).
 
 ## Drafting
 
 - Write replies with `outlook_draft_reply` (`mode`: `reply`, `reply_all` or `forward`) and new mail with `outlook_draft_new`. Both only save a draft and return its id.
 - Match the user's voice from their sent mail (`outlook_list` on `Sent Items`). Keep it short. Their signature is added by Outlook; don't type one.
 - Use `reply` by default. Use `reply_all` only when everyone on the thread needs the answer.
+- Attach local files with `attachments: ["/path/file.pdf", ...]` on either tool. `outlook_read_draft` lists the attachment names, so check them there.
+- If the conversation already has an unsent draft, `outlook_draft_reply` stops and shows it. Pass `replace_existing: true` to put the new text in that draft, or discard it first.
+- `outlook_edit_draft` changes a draft: `body` replaces the text above the signature and quoted thread; `to`/`cc`/`bcc` replace that field; `subject`; `attachments` are added.
+- Replies in one conversation share one draft id. When several do, pass `match` (part of the text) to `outlook_read_draft` or `outlook_edit_draft`; `outlook_discard_draft` uses `expected_subject` the same way.
 
 ## Sending
 

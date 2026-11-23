@@ -202,12 +202,13 @@ async function scrollTop(p) {
 // The message list is virtualised: scroll through it to collect items, then scroll back.
 // Pinned conversations sit at the top of a folder whatever their date, so they don't count
 // towards `limit` (otherwise a handful of pins hides every new message).
-async function listFolder(p, { unread_only = false, limit = 50, match = '' }) {
+// Drafts in one conversation share its id, so in Drafts (by_item) each draft is kept, not just the first.
+async function listFolder(p, { unread_only = false, limit = 50, match = '', by_item = false }) {
   const seen = new Map();
   const want = i => (!unread_only || i.unread) && (!match || i.summary.toLowerCase().includes(match.toLowerCase()));
   const counted = () => [...seen.values()].filter(i => !/Pinned/.test(i.flags)).length;
   for (let i = 0; i < 80 && counted() < limit; i++) {
-    for (const it of await visibleItems(p)) if (!seen.has(it.id) && want(it)) seen.set(it.id, it);
+    for (const it of await visibleItems(p)) { const k = by_item ? it.id + '|' + it.summary : it.id; if (!seen.has(k) && want(it)) seen.set(k, it); }
     if (!(await scrollList(p))) break;
   }
   await scrollTop(p);
@@ -225,16 +226,18 @@ const fmtList = l => {
           `Newest first (${rest.length}):\n` + (rest.map(fmtItem).join('\n') || 'Nothing.')].filter(Boolean).join('\n\n');
 };
 
-async function findItem(p, id) {
+// `needle` (part of the item's subject or text) picks one item when several share the id (drafts).
+async function findItem(p, id, needle = '') {
+  const sel = `[role=listbox] [role=option][data-convid="${id}"]` + (needle ? `[aria-label*="${needle.replace(/["\\]/g, '\\$&')}" i]` : '');
   for (let pass = 0; pass < 2; pass++) {
     for (let i = 0; i < 60; i++) {
-      const it = p.locator(`[role=listbox] [role=option][data-convid="${id}"]`).first();
+      const it = p.locator(sel).first();
       if (await it.count()) return it;
       if (!(await scrollList(p))) break;
     }
     await scrollTop(p);
   }
-  throw new Error('Conversation not found in this folder: ' + id);
+  throw new Error(needle ? `Nothing with id ${id} and text "${needle}" in this folder.` : 'Conversation not found in this folder: ' + id);
 }
 
 async function readingPaneText(p, max) {
@@ -242,7 +245,28 @@ async function readingPaneText(p, max) {
   // expand collapsed earlier messages so the whole thread is captured
   await p.evaluate(() => document.querySelectorAll('[aria-label="Reading Pane"] [aria-expanded=false][role=button]').forEach(b => b.click())).catch(() => {});
   await p.waitForTimeout(800);
-  const t = await p.evaluate(() => (document.querySelector('[aria-label="Reading Pane"]') || document.querySelector('[role=main]'))?.innerText || '');
+  const t = await p.evaluate(() => {
+    const pane = document.querySelector('[aria-label="Reading Pane"]') || document.querySelector('[role=main]');
+    if (!pane) return '';
+    // Show each link's address after its text ("Verify <https://...>"), unwrapping Safe Links.
+    // Skip mailto/tel, links whose text already is the address, and all but the last of a run of
+    // pieces of one link (a signature can split a word into one link per letter).
+    const added = [];
+    const as = [...pane.querySelectorAll('[aria-label="Message body"] a[href], [id^=UniqueMessageBody] a[href]')];
+    as.forEach((a, i) => {
+      let url = a.getAttribute('href') || '';
+      if (!/^https?:/i.test(url) || as[i + 1]?.getAttribute('href') === url) return;
+      try { const u = new URL(url); if (/safelinks\.protection\.outlook\.com$/i.test(u.hostname) && u.searchParams.get('url')) url = u.searchParams.get('url'); } catch {}
+      const txt = a.innerText.replace(/\s+/g, ' ').trim();
+      const bare = s => s.replace(/^https?:\/\/(www\.)?/i, '').replace(/\/$/, '').toLowerCase();
+      if (!txt || bare(txt) === bare(url) || bare(url).startsWith(bare(txt)) && /\.\w/.test(txt)) return;
+      const s = document.createElement('span'); s.setAttribute('data-mcp-link', ''); s.textContent = ` <${url}>`;
+      a.after(s); added.push(s);
+    });
+    const out = pane.innerText;
+    added.forEach(s => s.remove());
+    return out;
+  });
   return t.replace(/[͏‌­]+/g, '').replace(/[ \t ]+\n/g, '\n').replace(/\n{2,}/g, '\n')
     .replace(/^(Summarize this email|Reply|Reply all|Forward)\n/gm, '').slice(0, max);
 }
@@ -250,14 +274,32 @@ async function readingPaneText(p, max) {
 async function openConversation(p, folder, id, mark_read) {
   await openFolder(p, folder);
   const it = await findItem(p, id);
-  const wasUnread = /^Unread\b/.test((await it.getAttribute('aria-label')) || '');
+  const label = (await it.getAttribute('aria-label')) || '';
+  const wasUnread = /^Unread\b/.test(label);
   await it.click();
   if (wasUnread && mark_read) { await p.waitForTimeout(500); await p.keyboard.press('Control+q').catch(() => {}); }
   if (wasUnread && !mark_read) { await p.waitForTimeout(1500); await p.keyboard.press('Control+u').catch(() => {}); }
-  return wasUnread;
+  return label;      // the list shows "[Draft]" in it while the conversation holds an unsent draft
 }
 
-async function fillBody(p, body) {
+// Click Reply, Reply all or Forward for an open conversation. The ribbon's buttons act on the
+// newest message but are disabled while the conversation holds a draft (even a discarded one,
+// still shown from Deleted Items); then use the reading pane's own (menu item) buttons.
+async function clickReply(p, mode) {
+  const label = { reply: 'Reply', reply_all: 'Reply all', forward: 'Forward' }[mode];
+  const enabled = `[aria-label="${label}"]:not([aria-disabled="true"]):not([disabled])`;
+  const ribbon = p.locator(`button${enabled}:not([aria-label="Reading Pane"] *)`).filter({ visible: true });
+  const pane = p.locator('[aria-label="Reading Pane"]').locator(`button${enabled}, [role=button]${enabled}, [role=menuitem]${enabled}`).filter({ visible: true });
+  for (let i = 0; i < 20; i++) {
+    for (const b of [ribbon.first(), pane.first()]) if (await b.isVisible().catch(() => false)) { await b.click(); return; }
+    await p.waitForTimeout(500);
+  }
+  throw new Error(`No enabled "${label}" button for this conversation. Use browser_screenshot.`);
+}
+
+// Type `body` at the top of the message. With replace, first remove the text already written there
+// (everything above the signature or the quoted thread, which stay).
+async function fillBody(p, body, { replace = false } = {}) {
   await clearOverlays(p);
   const ed = p.locator('[contenteditable=true][aria-label*="Message body"], div[role=textbox][aria-label*="Message body"]').first();
   await ed.waitFor({ timeout: 15000 });
@@ -270,6 +312,18 @@ async function fillBody(p, body) {
     await p.waitForTimeout(500);
   }
   await ed.click();
+  if (replace) {
+    const sel = await ed.evaluate(e => {
+      const kids = [...e.children];
+      const stop = kids.findIndex(c => /^(Signature|appendonsend|divRplyFwdMsg)$/.test(c.id) || c.tagName === 'HR' || c.querySelector('#Signature, #divRplyFwdMsg'));
+      const r = document.createRange();
+      r.setStart(e, 0);
+      if (stop < 0) r.setEnd(e, e.childNodes.length); else r.setEndBefore(kids[stop]);
+      const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+      return !r.collapsed;
+    });
+    if (sel) { await p.waitForTimeout(200); await p.keyboard.press('Delete'); await p.waitForTimeout(300); }
+  }
   await p.keyboard.press('Control+Home');
   for (const [i, line] of body.split('\n').entries()) {
     if (i) await p.keyboard.press('Enter');
@@ -319,6 +373,66 @@ async function addRecipients(p, field, list) {
   for (const a of list) { await p.keyboard.insertText(a); await p.waitForTimeout(800); await p.keyboard.press(';'); await p.waitForTimeout(400); }
 }
 
+// Remove every recipient from a field of the open compose form.
+async function clearRecipients(p, field) {
+  const box = recipientBox(p, field);
+  if (!(await box.isVisible().catch(() => false))) return;
+  for (let i = 0; i < 50; i++) {
+    const x = box.locator('#removeButton').first();
+    if (!(await x.count())) return;
+    await x.click(); await p.waitForTimeout(300);
+  }
+}
+
+// Check local files before opening any form, so a bad path fails without leaving a half-made draft.
+function localFiles(list) {
+  return list.map(f => {
+    const abs = path.resolve(f.replace(/^~(?=\/)/, process.env.HOME));
+    let st; try { st = fs.statSync(abs); } catch { throw new Error(`No such file: ${f}`); }
+    if (!st.isFile()) throw new Error(`Not a file: ${f}`);
+    return abs;
+  });
+}
+
+// Names (and sizes) of the files attached to the open compose form.
+async function composeAttachments(p) {
+  return p.evaluate(() => {
+    const ed = document.querySelector('[contenteditable=true][aria-label*="Message body"]');
+    let root = ed;
+    while (root && !root.querySelector('input[aria-label="Subject"], input[aria-label="Add a subject"], input[placeholder="Add a subject"]')) root = root.parentElement;
+    return [...(root || document).querySelectorAll('[role=listbox][aria-label="file attachments"] [role=option]')].map(e => {
+      const name = (e.querySelector('[title]')?.getAttribute('title') || e.innerText.split('\n')[0]).trim();
+      const size = (e.innerText.match(/[\d.,]+ (?:bytes|KB|MB|GB)/) || [''])[0];
+      return { name, size, busy: /upload|%/i.test(e.innerText) || !!e.querySelector('[role=progressbar]') };
+    });
+  });
+}
+
+// Attach local files to the open compose form through Attach file > Browse this computer.
+async function attachFiles(p, files) {
+  if (!files.length) return;
+  await clearOverlays(p);
+  const before = (await composeAttachments(p)).length;
+  const msgTab = p.getByRole('tab', { name: 'Message', exact: true }).first();
+  if (await msgTab.isVisible().catch(() => false) && (await msgTab.getAttribute('aria-selected')) !== 'true') { await msgTab.click(); await p.waitForTimeout(500); }
+  const btn = p.locator('button[aria-label="Attach file"], button[label="Attach file"]').filter({ visible: true }).first();
+  await btn.waitFor({ timeout: 10000 }).catch(() => { throw new Error('No "Attach file" button on the compose ribbon. Use browser_screenshot.'); });
+  await btn.click(); await p.waitForTimeout(800);
+  const chooser = p.waitForEvent('filechooser', { timeout: 10000 });
+  await p.getByRole('menuitem', { name: /Browse this computer/i }).first().click();
+  await (await chooser).setFiles(files);
+  const names = files.map(f => path.basename(f));
+  for (let i = 0; i < 240; i++) {      // up to 2 minutes for uploads
+    await p.waitForTimeout(500);
+    // Outlook offers to share large files as a OneDrive link instead; that is the user's call.
+    const ask = p.locator('[role=dialog][aria-modal=true], [role=alertdialog]').filter({ visible: true });
+    if (await ask.count()) { const msg = (await ask.first().innerText()).replace(/\s+/g, ' ').slice(0, 200); await clearOverlays(p); throw new Error(`Outlook asked something while attaching, and it was cancelled: "${msg}". The draft may have been autosaved.`); }
+    const now = await composeAttachments(p);
+    if (now.length >= before + files.length && names.every(n => now.some(a => a.name === n)) && !now.some(a => a.busy)) return;
+  }
+  throw new Error(`The attachments did not finish uploading (${names.join(', ')}). Use browser_screenshot.`);
+}
+
 // Save the open compose form as a draft, then reload the mail view so the page is clean.
 async function saveDraft(p) {
   await p.keyboard.press('Control+s');
@@ -333,15 +447,26 @@ async function saveDraft(p) {
 // Find a draft's id in Drafts by a piece of its text (subject or body).
 async function draftIdFor(p, needle) {
   await openFolder(p, 'Drafts');
-  const hit = (await listFolder(p, { limit: 50, match: needle }))[0];
+  const hit = (await listFolder(p, { limit: 50, match: needle, by_item: true }))[0];
   return hit?.id;
 }
 
-// Open a draft from Drafts in the compose form. New-mail drafts open straight into it;
-// reply drafts open as a preview with an Edit (pencil) button.
-async function openDraftForEdit(p, id) {
+// The drafts in Drafts with this id (a conversation id: drafts replying in one conversation share it).
+async function draftsWithId(p, id) {
   await openFolder(p, 'Drafts');
-  const it = await findItem(p, id);
+  return (await listFolder(p, { limit: 200, by_item: true })).filter(d => d.id === id);
+}
+
+// Open a draft from Drafts in the compose form. New-mail drafts open straight into it;
+// reply drafts may open as a preview with an Edit (pencil) button. `match` (part of its subject
+// or text) picks one when several drafts share the id.
+async function openDraftForEdit(p, id, match = '') {
+  await openFolder(p, 'Drafts');
+  if (!match) {
+    const same = await p.locator(`[role=listbox] [role=option][data-convid="${id}"]`).count();
+    if (same > 1) throw new Error(`${same} drafts share id ${id} (replies in one conversation). Pass part of the one you mean as \`match\`:\n` + (await draftsWithId(p, id)).map(d => '  ' + d.summary).join('\n'));
+  }
+  const it = await findItem(p, id, match);
   await it.click();
   await clearOverlays(p);
   const editor = p.locator('[contenteditable=true][aria-label*="Message body"]').first();
@@ -356,7 +481,7 @@ async function openDraftForEdit(p, id) {
 
 // What the open compose form holds: recipients, subject and body text.
 async function composeSummary(p, max = 6000) {
-  return p.evaluate(max => {
+  const c = await p.evaluate(() => {
     const field = f => {
       const el = document.querySelector(`[contenteditable=true][aria-label="${f}"], [contenteditable=true][aria-label="${f} recipients"]`);
       let box = el; for (let i = 0; i < 3 && box && !box.innerText.trim(); i++) box = box.parentElement;
@@ -365,8 +490,11 @@ async function composeSummary(p, max = 6000) {
     };
     const subject = document.querySelector('input[aria-label="Subject"]')?.value || '';
     const body = document.querySelector('[contenteditable=true][aria-label*="Message body"]')?.innerText.replace(/\n{3,}/g, '\n\n').trim() || '';
-    return [field('To'), field('Cc'), field('Bcc'), 'Subject: ' + subject, '', body].filter((x, i) => x || i === 4).join('\n').slice(0, max);
-  }, max);
+    return { head: [field('To'), field('Cc'), field('Bcc'), 'Subject: ' + subject], body };
+  });
+  const att = await composeAttachments(p);
+  if (att.length) c.head.push('Attachments: ' + att.map(a => `${a.name} (${a.size})`).join(', '));
+  return [...c.head.filter(Boolean), '', c.body].join('\n').slice(0, max);
 }
 
 async function leaveCompose(p) {
@@ -495,7 +623,7 @@ server.registerTool('outlook_list', {
   inputSchema: { folder: z.string().default('Inbox'), unread_only: z.boolean().default(false), limit: z.number().int().min(1).max(200).default(40), match: z.string().default(''), include_pinned: z.boolean().default(true) },
 }, tool(async ({ folder, unread_only, limit, match, include_pinned }) => {
   const p = await page(); await openFolder(p, folder);
-  const l = await listFolder(p, { unread_only, limit, match });
+  const l = await listFolder(p, { unread_only, limit, match, by_item: /^drafts$/i.test(folder) });
   return fmtList(include_pinned ? l : l.filter(i => !/Pinned/.test(i.flags)));
 }));
 
@@ -569,53 +697,99 @@ server.registerTool('outlook_read_search_result', {
   inputSchema: { id: z.string(), max_chars: z.number().int().default(12000) },
 }, tool(async ({ id, max_chars }) => { const p = await page(); const it = await findItem(p, id); await it.click(); return readingPaneText(p, max_chars); }));
 
+const ATTACH = z.array(z.string()).default([]).describe('Local file paths to attach');
+const LEAD = body => body.split('\n').find(l => l.trim())?.trim().slice(0, 40) || '';
+
+// Change the open compose form (a draft being edited) and save it.
+async function editOpenDraft(p, { body, subject, to, cc, bcc, attachments }) {
+  for (const [field, list] of [['To', to], ['Cc', cc], ['Bcc', bcc]]) if (list) { await clearRecipients(p, field); await addRecipients(p, field, list); }
+  if (subject !== undefined) {
+    const subj = p.locator('input[aria-label="Subject"], input[aria-label="Add a subject"], input[placeholder="Add a subject"]').filter({ visible: true }).first();
+    await subj.click(); await subj.fill(subject);
+  }
+  await attachFiles(p, attachments || []);
+  if (body !== undefined) await fillBody(p, body, { replace: true });
+  const summary = await composeSummary(p, 3000);
+  await saveDraft(p);
+  return summary;
+}
+
 server.registerTool('outlook_draft_reply', {
-  description: 'Write a reply, reply-all or forward for a conversation and save it as a draft (does not send). The text goes above the quoted thread. Forward needs `to`. Returns the draft id for outlook_send_draft.',
+  description: 'Write a reply, reply-all or forward for a conversation and save it as a draft (does not send). The text goes above the quoted thread. Forward needs `to`. `attachments` are local file paths. If the conversation already has an unsent draft it stops and says so, unless replace_existing is true: then the existing draft gets this text (and any to/cc/attachments) instead of a second draft being made. Returns the draft id for outlook_send_draft.',
   inputSchema: {
     folder: z.string().default('Inbox'), id: z.string(), body: z.string(),
     mode: z.enum(['reply', 'reply_all', 'forward']).default('reply'),
     to: z.array(z.string()).default([]), cc: z.array(z.string()).default([]),
+    attachments: ATTACH,
+    replace_existing: z.boolean().default(false).describe('If the conversation already has a draft, replace that draft\'s text instead of stopping'),
   },
-}, tool(async ({ folder, id, body, mode, to, cc }) => {
+}, tool(async ({ folder, id, body, mode, to, cc, attachments, replace_existing }) => {
   if (mode === 'forward' && !to.length) throw new Error('A forward needs at least one address in `to`.');
-  const p = await page(); await openConversation(p, folder, id, true);
+  const files = localFiles(attachments);
+  const p = await page();
+  // Drafts replying in a conversation carry its id. (The list's "[Draft]" mark can lag, so look in Drafts.)
+  const drafts = await draftsWithId(p, id);
+  if (drafts.length) {
+    const list = drafts.map(d => '  ' + d.summary).join('\n');
+    const what = drafts.length > 1 ? `${drafts.length} unsent drafts` : 'an unsent draft';
+    if (!replace_existing) throw new Error(`This conversation already has ${what} (draft id ${id}):\n${list}\nNothing was changed. To put this text in that draft instead, call again with replace_existing: true (or use outlook_edit_draft). To start afresh, outlook_discard_draft it first.`);
+    if (drafts.length > 1) throw new Error(`This conversation has ${what} (draft id ${id}):\n${list}\nUse outlook_edit_draft with \`match\` to pick one, or discard the extras.`);
+    await openDraftForEdit(p, id);
+    await editOpenDraft(p, { body, to: to.length ? to : undefined, cc: cc.length ? cc : undefined, attachments: files });
+    return `Replaced the text of the existing draft (not sent). Draft id: ${id}`;
+  }
+  await openConversation(p, folder, id, true);
   await p.waitForTimeout(1500); await clearOverlays(p);
-  const name = { reply: /^Reply$/, reply_all: /^Reply all$/, forward: /^Forward$/ }[mode];
-  // The ribbon button can be disabled while the reading pane's own buttons work, so take an enabled one.
-  const btn = p.getByRole('button', { name }).filter({ visible: true })
-    .and(p.locator(':not([aria-disabled="true"]):not([disabled])')).last();
-  await btn.waitFor({ timeout: 10000 }).catch(() => { throw new Error(`No enabled "${mode}" button for this conversation.`); });
-  await btn.click();
+  await clickReply(p, mode);
   await waitForCompose(p);
   await addRecipients(p, 'To', to);
   await addRecipients(p, 'Cc', cc);
+  await attachFiles(p, files);
   await fillBody(p, body);
   await saveDraft(p);
-  const draft = await draftIdFor(p, body.split('\n').find(Boolean).slice(0, 40));
+  const draft = await draftIdFor(p, LEAD(body));
   return `Draft saved (not sent). Draft id: ${draft || '(not found in Drafts yet; list Drafts)'}`;
 }));
 
 server.registerTool('outlook_draft_new', {
-  description: 'Write a new email and save it as a draft (does not send). to/cc/bcc are lists of email addresses. Returns the draft id for outlook_send_draft.',
-  inputSchema: { to: z.array(z.string()).default([]), cc: z.array(z.string()).default([]), bcc: z.array(z.string()).default([]), subject: z.string(), body: z.string() },
-}, tool(async ({ to, cc, bcc, subject, body }) => {
+  description: 'Write a new email and save it as a draft (does not send). to/cc/bcc are lists of email addresses; `attachments` are local file paths. Returns the draft id for outlook_send_draft.',
+  inputSchema: { to: z.array(z.string()).default([]), cc: z.array(z.string()).default([]), bcc: z.array(z.string()).default([]), subject: z.string(), body: z.string(), attachments: ATTACH },
+}, tool(async ({ to, cc, bcc, subject, body, attachments }) => {
+  const files = localFiles(attachments);
   const p = await page(); await openNewCompose(p);
   await addRecipients(p, 'To', to);
   await addRecipients(p, 'Cc', cc);
   await addRecipients(p, 'Bcc', bcc);
   const subj = p.locator('input[aria-label="Subject"], input[aria-label="Add a subject"], input[placeholder="Add a subject"]').filter({ visible: true }).first();
   await subj.click(); await subj.fill(subject);
+  await attachFiles(p, files);
   await fillBody(p, body);
   await saveDraft(p);
   const draft = await draftIdFor(p, subject);
   return `Draft saved (not sent). Draft id: ${draft || '(not found in Drafts yet; list Drafts)'}`;
 }));
 
+server.registerTool('outlook_edit_draft', {
+  description: 'Change a draft in Drafts and save it (does not send). Only the fields given change: `body` replaces the text written above the signature and quoted thread (both kept); to/cc/bcc replace that field\'s recipients; `subject` replaces the subject; `attachments` (local file paths) are added. `match` (part of its subject or text) picks the draft when several share one id, as replies in one conversation do.',
+  inputSchema: {
+    id: z.string(), match: z.string().default(''),
+    body: z.string().optional(), subject: z.string().optional(),
+    to: z.array(z.string()).optional(), cc: z.array(z.string()).optional(), bcc: z.array(z.string()).optional(),
+    attachments: ATTACH,
+  },
+}, tool(async ({ id, match, body, subject, to, cc, bcc, attachments }) => {
+  const files = localFiles(attachments);
+  if ([body, subject, to, cc, bcc].every(x => x === undefined) && !files.length) throw new Error('Nothing to change: give body, subject, to, cc, bcc or attachments.');
+  const p = await page(); await openDraftForEdit(p, id, match);
+  const summary = await editOpenDraft(p, { body, subject, to, cc, bcc, attachments: files });
+  return `Draft updated (not sent). Draft id: ${id}\n\n${summary}`;
+}));
+
 server.registerTool('outlook_read_draft', {
-  description: 'Show a draft from Drafts (recipients, subject and text) so the user can check it before sending.',
-  inputSchema: { id: z.string(), max_chars: z.number().int().default(6000) },
-}, tool(async ({ id, max_chars }) => {
-  const p = await page(); await openDraftForEdit(p, id);
+  description: 'Show a draft from Drafts (recipients, subject, attachment names and text) so the user can check it before sending. `match` (part of its subject or text) picks the draft when several share one id.',
+  inputSchema: { id: z.string(), match: z.string().default(''), max_chars: z.number().int().default(6000) },
+}, tool(async ({ id, match, max_chars }) => {
+  const p = await page(); await openDraftForEdit(p, id, match);
   const t = await composeSummary(p, max_chars);
   await leaveCompose(p);
   return t;
@@ -627,9 +801,13 @@ server.registerTool('outlook_send_draft', {
 }, tool(async ({ id, expected_subject }) => {
   if (!SEND_ENABLED) throw new Error('Sending is disabled. Start the server with OUTLOOK_ENABLE_SEND=1 to allow it.');
   const p = await page(); await openFolder(p, 'Drafts');
-  const it = await findItem(p, id);
-  const label = (await it.getAttribute('aria-label')) || '';
-  if (!label.toLowerCase().includes(expected_subject.toLowerCase())) throw new Error(`Draft ${id} does not match "${expected_subject}": ${label.slice(0, 150)}`);
+  const it = await findItem(p, id).catch(() => null);
+  if (!it) throw new Error(`No draft with id ${id} in Drafts.`);
+  if (!(await p.locator(`[role=listbox] [role=option][data-convid="${id}"]`).filter({ hasText: expected_subject }).count()) &&
+      !((await it.getAttribute('aria-label')) || '').toLowerCase().includes(expected_subject.toLowerCase()))
+    throw new Error(`Draft ${id} does not match "${expected_subject}": ${((await it.getAttribute('aria-label')) || '').slice(0, 150)}`);
+  if ((await p.locator(`[role=listbox] [role=option][data-convid="${id}"]`).count()) > 1)
+    throw new Error(`Several drafts share id ${id} (replies in one conversation); not sent. Discard the extras with outlook_discard_draft first.`);
   await openDraftForEdit(p, id);
   const summary = await composeSummary(p, 400);
   const who = summary.split('\n').filter(l => /^(To|Cc|Bcc):/.test(l)).join('; ');
@@ -644,23 +822,30 @@ server.registerTool('outlook_send_draft', {
 }));
 
 server.registerTool('outlook_discard_draft', {
-  description: 'Throw away a draft from Drafts (for example one made by mistake).',
+  description: 'Throw away a draft from Drafts (for example one made by mistake). When several drafts share the id (replies in one conversation), the one whose subject or text contains expected_subject goes.',
   inputSchema: { id: z.string(), expected_subject: z.string().describe('Part of the draft subject or text, as a check.') },
 }, tool(async ({ id, expected_subject }) => {
   const p = await page(); await openFolder(p, 'Drafts');
-  const it = await findItem(p, id);
-  if (!((await it.getAttribute('aria-label')) || '').toLowerCase().includes(expected_subject.toLowerCase())) throw new Error('That draft does not match expected_subject.');
+  const rows = () => p.locator(`[role=listbox] [role=option][data-convid="${id}"]`).filter({ hasText: expected_subject });
+  const it = await findItem(p, id, expected_subject).catch(async () => {
+    // the text may be in the preview rather than the label
+    const r = rows().first(); if (await r.count()) return r;
+    throw new Error('No draft with that id matches expected_subject.');
+  });
+  const before = await rows().count();
   await it.click(); await p.waitForTimeout(2500); await clearOverlays(p);
   const bin = p.locator('[aria-label="Reading Pane"], [role=main]').getByRole('button', { name: /^(Discard|Delete)/ }).filter({ visible: true }).first();
   await bin.click(); await p.waitForTimeout(1500);
   const ok = p.locator('[role=dialog], [role=alertdialog]').getByRole('button', { name: /^(OK|Discard|Delete)$/ }).filter({ visible: true });
   if (await ok.count()) await ok.first().click();
   await p.waitForTimeout(2500);
+  // Reload so the list and reading pane show the change, not a stale view.
+  await p.goto(BASE + '/mail/'); await p.locator('[role=tree]').first().waitFor({ timeout: 30000 }).catch(() => {});
   await openFolder(p, 'Drafts');
   // The list can lag behind the discard; give it a few seconds before saying it failed.
-  const left = p.locator(`[role=option][data-convid="${id}"]`).filter({ hasText: expected_subject });
-  for (let i = 0; i < 5 && await left.count(); i++) await p.waitForTimeout(2000);
-  return (await left.count()) ? 'Still in Drafts.' : 'Discarded.';
+  for (let i = 0; i < 5 && await rows().count() >= before; i++) await p.waitForTimeout(2000);
+  const left = await rows().count();
+  return left >= before ? 'Still in Drafts.' : left ? `Discarded one; ${left} more draft(s) with this id and text remain.` : 'Discarded.';
 }));
 
 
