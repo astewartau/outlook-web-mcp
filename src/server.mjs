@@ -1002,6 +1002,17 @@ async function gotoDate(cp, date) {
 
 const RESPONSE = { accept: 'Accept', tentative: 'Tentative', decline: 'Decline' };
 
+// Your response in an open event window. Unanswered: Accept, Tentative and Decline are buttons of their
+// own (Tentative may sit in the toolbar's "More options" overflow). Answered: one menu button named
+// after the response (id ..._RSVP) holds the other options. The "Show as" menu (name=ShowAs) also
+// reads "Tentative" for unanswered invitations: it is free/busy, not a response.
+async function rsvpState(dlg) {
+  const menuBtn = dlg.locator('button[aria-haspopup=menu]:not([name=ShowAs])').filter({ hasText: /^[^A-Za-z]*(Accepted|Tentative|Declined)[^A-Za-z]*$/ }).first();
+  if (!(await menuBtn.isVisible().catch(() => false))) return { current: null, menuBtn: null };
+  const text = (await menuBtn.innerText()).match(/Accepted|Tentative|Declined/)[0];
+  return { current: { Accepted: 'accept', Tentative: 'tentative', Declined: 'decline' }[text], menuBtn };
+}
+
 server.registerTool('outlook_event', {
   description: 'Open a calendar event by date (YYYY-MM-DD) and part of its title: organiser, attendees and their responses, time, location, Teams link, your response and the description.',
   inputSchema: { date: z.string(), title: z.string(), max_chars: z.number().int().default(5000) },
@@ -1023,25 +1034,26 @@ server.registerTool('outlook_event_respond', {
   try {
     const dlg = await openEvent(cp, date, title);
     const word = RESPONSE[response];
-    // Already responded: the response buttons are folded into a menu named after the current response.
-    const menuBtn = dlg.locator('button[aria-haspopup=menu]').filter({ hasText: /Accepted|Tentative|Declined/ }).first();
-    const hasMenu = await menuBtn.isVisible().catch(() => false);
+    const { current, menuBtn } = await rsvpState(dlg);
+    const option = async name => {                  // a response option: its own button, or in a menu
+      // (not a menu button: "Show as" also reads "Tentative")
+      const direct = dlg.getByRole('button', { name, exact: true }).and(dlg.locator(':not([aria-haspopup])')).filter({ visible: true }).first();
+      if (await direct.isVisible().catch(() => false)) return direct.click();
+      const menu = menuBtn || dlg.getByRole('button', { name: 'More options', exact: true }).first();
+      await menu.click(); await cp.waitForTimeout(800);
+      await cp.getByRole('menuitem', { name, exact: true }).click();
+    };
     if (note) {
-      const direct = dlg.getByRole('button', { name: 'RSVP with note', exact: true });
-      if (await direct.isVisible().catch(() => false)) await direct.click();
-      else { await menuBtn.click(); await cp.waitForTimeout(800); await cp.getByRole('menuitem', { name: 'RSVP with note', exact: true }).click(); }
+      await option('RSVP with note');
       const rsvp = cp.getByRole('dialog').filter({ hasText: 'RSVP to' }).last();
       await rsvp.waitFor({ timeout: 10000 });
       await rsvp.locator('textarea, [contenteditable=true]').first().fill(note);
       await rsvp.getByRole('combobox', { name: 'Select an option' }).click(); await cp.waitForTimeout(700);
       await cp.getByRole('option', { name: word, exact: true }).click(); await cp.waitForTimeout(500);
       await rsvp.getByRole('button', { name: 'Confirm', exact: true }).click();
-    } else if (hasMenu) {
-      if ((await menuBtn.innerText()).includes(word === 'Accept' ? 'Accepted' : word === 'Decline' ? 'Declined' : 'Tentative')) return `Already ${response === 'accept' ? 'accepted' : response === 'decline' ? 'declined' : 'tentative'}; nothing sent.`;
-      await menuBtn.click(); await cp.waitForTimeout(800);
-      await cp.getByRole('menuitem', { name: word, exact: true }).click();
     } else {
-      await dlg.getByRole('button', { name: word, exact: true }).click();
+      if (current === response) return `Already ${{ accept: 'accepted', tentative: 'tentative', decline: 'declined' }[response]}; nothing sent.`;
+      await option(word);
     }
     await cp.waitForTimeout(3000);
     const ask = cp.locator('[role=alertdialog], [role=dialog][aria-modal=true]').filter({ hasNotText: title }).filter({ visible: true });
@@ -1094,7 +1106,8 @@ server.registerTool('outlook_event_create', {
     await cp.waitForTimeout(1000);
     const summary = (await cp.locator('[role=dialog]').filter({ has: cp.locator('input[placeholder="Add title"]') }).last().innerText().catch(() => '')).replace(/[\uE000-\uF8FF]/g, '').replace(/\s+/g, ' ').slice(0, 600);
     const saveName = attendees.length ? 'Send' : 'Save';
-    await form.getByRole('button', { name: saveName, exact: true }).click();
+    // Send is a split button now: its menu half shares the name, so take the half that shows the text
+    await form.getByRole('button', { name: saveName, exact: true }).filter({ hasText: saveName }).first().click();
     await cp.waitForTimeout(4000);
     const ask = cp.locator('[role=alertdialog], [role=dialog][aria-modal=true]').filter({ visible: true }).filter({ hasNotText: 'Add title' });
     if (await ask.count()) { const msg = (await ask.first().innerText()).replace(/\s+/g, ' ').slice(0, 300); await clearOverlays(cp); throw new Error(`Outlook asked something and it was cancelled: "${msg}"`); }
