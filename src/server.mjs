@@ -45,9 +45,13 @@ async function withLock(fn) {
 }
 
 // The server's own tab, marked with window.name so it never adopts a tab someone else opened.
+// It is brought to the front on every call: the calendar and people tools work in a second tab,
+// and closing a tab activates a neighbour, not this one. In a background tab the message list
+// doesn't re-render when scrolled and screenshots wait for a frame that never comes, so folder
+// lists stop at the rows first drawn and lookups fail (26 Nov 2026).
 async function page() {
   if (!browser || !browser.isConnected()) { browser = await chromium.connectOverCDP(CDP_URL); tab = null; }
-  if (tab && !tab.isClosed()) return tab;
+  if (tab && !tab.isClosed()) { await tab.bringToFront().catch(() => {}); return tab; }
   const ctx = browser.contexts()[0];
   for (const p of ctx.pages()) {
     // window.name is cleared by the cross-site trip through the sign-in pages; sessionStorage survives it.
@@ -163,8 +167,34 @@ async function openFolder(p, folder) {
   }
   await t.last().scrollIntoViewIfNeeded().catch(() => {});
   await t.last().click();
+  // Check it landed: the folder selected and no search left in the search box.
+  for (let i = 0; i < 20; i++) {
+    if ((await t.last().getAttribute('aria-selected').catch(() => '')) === 'true' && !(await searchQuery(p))) break;
+    if (i === 19) throw new Error(`Clicked the folder "${folder}" but the page did not switch to it. ` + await describeList(p));
+    await p.waitForTimeout(250);
+  }
   await p.locator('[role=listbox]').first().waitFor({ timeout: 15000 }).catch(() => {});
-  await p.waitForTimeout(1500);
+  await p.waitForTimeout(1000);
+}
+
+const searchQuery = p => p.locator('input[aria-label*="Search"]').first().inputValue({ timeout: 2000 }).catch(() => '');
+
+// What the mail view shows, for error messages: selected folder, search, and the list's first and last rows.
+async function describeList(p) {
+  const d = await p.evaluate(() => {
+    const sel = [...document.querySelectorAll('[role=tree] [role=treeitem][aria-selected=true]')]
+      .map(e => (e.getAttribute('aria-label') || e.innerText).replace(/[\uE000-\uF8FF]/g, '').replace(/\s+/g, ' ').replace(/ selected\b.*$/, '').trim()).pop() || '';
+    const search = document.querySelector('input[aria-label*="Search"]')?.value || '';
+    const lb = document.querySelector('[role=listbox][aria-label^="Message list"]') || [...document.querySelectorAll('[role=listbox]')].find(l => l.querySelector('[data-convid]'));
+    const rows = lb ? [...lb.querySelectorAll('[role=option][data-convid]')].map(e => (e.getAttribute('aria-label') || '').replace(/\s+/g, ' ').slice(0, 80)) : [];
+    const sc = lb && [lb, ...lb.querySelectorAll('*')].find(e => e.scrollHeight > e.clientHeight + 4 && /auto|scroll/.test(getComputedStyle(e).overflowY));
+    return { sel, search, rows, pos: sc ? `scrolled ${Math.round(sc.scrollTop)} of ${sc.scrollHeight - sc.clientHeight} px` : 'not scrollable', list: !!lb, hidden: document.visibilityState !== 'visible' };
+  }).catch(e => ({ error: e.message }));
+  if (d.error) return `The page could not be read (${d.error}).`;
+  return [`The page shows: ${d.search ? `search results for "${d.search}"` : `folder "${d.sel || '(none selected)'}"`}`,
+    d.list ? `${d.rows.length} rows drawn, ${d.pos}` : 'no message list',
+    d.rows.length ? `first row "${d.rows[0]}", last row "${d.rows[d.rows.length - 1]}"` : '',
+    d.hidden ? 'the Outlook tab is in the background' : ''].filter(Boolean).join('; ') + '.';
 }
 
 const FLAG = /^((?:Unread |Collapsed |Expanded |Flagged |Pinned |Replied |Forwarded |Has attachments |Important |Mentioned |Draft )+)/;
@@ -178,25 +208,45 @@ async function visibleItems(p) {
   });
 }
 
+// Scroll the message list by setting scrollTop on its scrolling element (a div inside the listbox),
+// not with mouse-wheel events: those depend on where the mouse is and on the tab being in front,
+// and in a background tab each one could take a minute.
+// Moves one screen less a row, so no row is skipped. Returns null if there is no message list.
+async function scrollListTo(p, how) {
+  return p.evaluate(how => {
+    const lb = document.querySelector('[role=listbox][aria-label^="Message list"]') || [...document.querySelectorAll('[role=listbox]')].find(l => l.querySelector('[data-convid]'));
+    if (!lb) return null;
+    const sc = [lb, ...lb.querySelectorAll('*')].find(e => e.scrollHeight > e.clientHeight + 4 && /auto|scroll/.test(getComputedStyle(e).overflowY));
+    if (!sc) return { moved: false };
+    const before = sc.scrollTop;
+    sc.scrollTop = how === 'top' ? 0 : before + Math.max(100, sc.clientHeight - 80);
+    return { moved: Math.abs(sc.scrollTop - before) > 1 };
+  }, how);
+}
+
+const rowIds = async p => (await visibleItems(p)).map(i => i.id).join();
+
+// Wait (up to `ms`) for the drawn rows to differ from `before`.
+async function rowsChange(p, before, ms) {
+  for (let t = 0; t < ms; t += 150) { await p.waitForTimeout(150); if (await rowIds(p) !== before) { await p.waitForTimeout(150); return true; } }
+  return false;
+}
+
+// One screen down. False at the end of the list (after giving Outlook a moment to load more),
+// or when the list scrolled but drew no new rows.
 async function scrollList(p) {
-  const lb = p.locator('[role=listbox]').first();
-  if (!(await lb.count())) return false;
-  const bb = await lb.boundingBox();
-  if (!bb) return false;
-  const before = (await visibleItems(p)).map(i => i.id).join();
-  await p.mouse.move(bb.x + bb.width / 2, bb.y + Math.min(bb.height, 600) / 2);
-  await p.mouse.wheel(0, 600);
-  await p.waitForTimeout(900);
-  return (await visibleItems(p)).map(i => i.id).join() !== before;
+  const before = await rowIds(p);
+  const r = await scrollListTo(p, 'down');
+  if (!r) return false;
+  if (r.moved) return rowsChange(p, before, 2000);
+  await p.waitForTimeout(1200);                       // at the end: Outlook may be fetching more rows
+  const again = await scrollListTo(p, 'down');
+  return !!again?.moved && rowsChange(p, before, 2000);
 }
 
 async function scrollTop(p) {
-  if (!(await p.locator('[role=listbox]').count())) return;
-  const bb = await p.locator('[role=listbox]').first().boundingBox();
-  if (!bb) return;
-  await p.mouse.move(bb.x + bb.width / 2, bb.y + 100);
-  for (let i = 0; i < 30; i++) await p.mouse.wheel(0, -3000);
-  await p.waitForTimeout(800);
+  const before = await rowIds(p);
+  if ((await scrollListTo(p, 'top'))?.moved) await rowsChange(p, before, 1500);
 }
 
 // The message list is virtualised: scroll through it to collect items, then scroll back.
@@ -207,6 +257,7 @@ async function listFolder(p, { unread_only = false, limit = 50, match = '', by_i
   const seen = new Map();
   const want = i => (!unread_only || i.unread) && (!match || i.summary.toLowerCase().includes(match.toLowerCase()));
   const counted = () => [...seen.values()].filter(i => !/Pinned/.test(i.flags)).length;
+  await scrollTop(p);                                  // a folder already open may be scrolled down
   for (let i = 0; i < 80 && counted() < limit; i++) {
     for (const it of await visibleItems(p)) { const k = by_item ? it.id + '|' + it.summary : it.id; if (!seen.has(k) && want(it)) seen.set(k, it); }
     if (!(await scrollList(p))) break;
@@ -227,17 +278,23 @@ const fmtList = l => {
 };
 
 // `needle` (part of the item's subject or text) picks one item when several share the id (drafts).
+// Looks from the top of the list down, for at most ~30 seconds, then says what the page showed.
 async function findItem(p, id, needle = '') {
   const sel = `[role=listbox] [role=option][data-convid="${id}"]` + (needle ? `[aria-label*="${needle.replace(/["\\]/g, '\\$&')}" i]` : '');
-  for (let pass = 0; pass < 2; pass++) {
-    for (let i = 0; i < 60; i++) {
-      const it = p.locator(sel).first();
-      if (await it.count()) return it;
-      if (!(await scrollList(p))) break;
-    }
-    await scrollTop(p);
+  const it = p.locator(sel).first();
+  if (await it.count()) return it;
+  const start = Date.now(), seen = new Set();
+  await scrollTop(p);
+  let end = false;
+  while (Date.now() - start < 30000) {
+    if (await it.count()) return it;
+    for (const v of await visibleItems(p)) seen.add(v.id);
+    if (!(await scrollList(p))) { end = true; break; }
   }
-  throw new Error(needle ? `Nothing with id ${id} and text "${needle}" in this folder.` : 'Conversation not found in this folder: ' + id);
+  if (await it.count()) return it;
+  const what = needle ? `Nothing with id ${id} and text "${needle}" in this folder.` : 'Conversation not found in this folder: ' + id + '.';
+  const how = `Looked through ${seen.size} conversations in ${Math.round((Date.now() - start) / 1000)} s` + (end ? ', until the list scrolled no further' : ', then stopped (time limit)');
+  throw new Error(`${what} ${how}. ${await describeList(p)}`);
 }
 
 async function readingPaneText(p, max) {
@@ -505,13 +562,18 @@ async function leaveCompose(p) {
 }
 
 
+// Run an Outlook search; the results replace the message list.
+async function runSearch(p, query) {
+  await ensureMail(p);
+  const box = p.getByRole('combobox', { name: /search/i }).or(p.locator('input[aria-label*="Search"]')).first();
+  await box.click(); await box.fill(query); await p.keyboard.press('Enter');
+  await p.waitForTimeout(4000);
+}
+
 // Open a conversation either from a folder or from a search (search results are not a folder).
 async function openTarget(p, { folder, id, search }) {
   if (search) {
-    await ensureMail(p);
-    const box = p.getByRole('combobox', { name: /search/i }).or(p.locator('input[aria-label*="Search"]')).first();
-    await box.click(); await box.fill(search); await p.keyboard.press('Enter');
-    await p.waitForTimeout(4000);
+    await runSearch(p, search);
     const it = await findItem(p, id); await it.click();
   } else {
     await openConversation(p, folder || 'Inbox', id, true);
@@ -685,17 +747,19 @@ server.registerTool('outlook_search', {
   description: 'Search all folders (Sent Items included) with Outlook search syntax. Combine terms: from:name, to:name, cc:name, subject:words, hasattachments:yes, attachment:filename, received:2026-11-18, received>=2026-11-01, received:this week, plus plain words. Use the user\'s own address rather than "me" to find mail they sent. Returns conversations with ids; open one with outlook_read_search_result.',
   inputSchema: { query: z.string(), limit: z.number().int().min(1).max(100).default(25) },
 }, tool(async ({ query, limit }) => {
-  const p = await page(); await ensureMail(p);
-  const box = p.getByRole('combobox', { name: /search/i }).or(p.locator('input[aria-label*="Search"]')).first();
-  await box.click(); await box.fill(query); await p.keyboard.press('Enter');
-  await p.waitForTimeout(4000);
+  const p = await page(); await runSearch(p, query);
   return fmtList(await listFolder(p, { limit }));
 }));
 
 server.registerTool('outlook_read_search_result', {
-  description: 'Open a conversation from the most recent outlook_search by id. Marks it read.',
-  inputSchema: { id: z.string(), max_chars: z.number().int().default(12000) },
-}, tool(async ({ id, max_chars }) => { const p = await page(); const it = await findItem(p, id); await it.click(); return readingPaneText(p, max_chars); }));
+  description: 'Open a conversation from search results by id. Marks it read. Pass the same `query` as the outlook_search that found it: the browser tab is shared, so any other outlook call in between (from this session or another) replaces the results on screen. Without `query` it uses the results still on screen, if any.',
+  inputSchema: { id: z.string(), query: z.string().optional(), max_chars: z.number().int().default(12000) },
+}, tool(async ({ id, query, max_chars }) => {
+  const p = await page();
+  if (query) await runSearch(p, query);
+  else if (!(await searchQuery(p))) throw new Error('The page no longer shows search results (another outlook call has used the tab since the search). Call again with `query` set to the search that found this id. ' + await describeList(p));
+  const it = await findItem(p, id); await it.click(); return readingPaneText(p, max_chars);
+}));
 
 const ATTACH = z.array(z.string()).default([]).describe('Local file paths to attach');
 const LEAD = body => body.split('\n').find(l => l.trim())?.trim().slice(0, 40) || '';

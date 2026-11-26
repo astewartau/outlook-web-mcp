@@ -31,7 +31,7 @@ It also works with an ordinary desktop Chrome started with `--remote-debugging-p
 | `outlook_list` | Conversations in a folder: pinned ones separately, then the newest `limit`; filter by unread or by text |
 | `outlook_read` | A whole conversation by id, with each link's address after its text (marks it read unless asked not to) |
 | `outlook_read_unread` | Every unread conversation in one folder or in all folders, marking each read |
-| `outlook_search` / `outlook_read_search_result` | Outlook search (`from:`, `subject:` …) and opening a result |
+| `outlook_search` / `outlook_read_search_result` | Outlook search (`from:`, `subject:` …) and opening a result (pass the same `query` to search again first) |
 | `outlook_mark` | Read, unread, flag, unflag, pin, unpin, archive, delete |
 | `outlook_draft_reply` | Reply, reply-all or forward, saved as a draft, with optional attachments. Stops if the conversation already has a draft, unless told to replace that draft's text |
 | `outlook_draft_new` | New email saved as a draft, with optional attachments |
