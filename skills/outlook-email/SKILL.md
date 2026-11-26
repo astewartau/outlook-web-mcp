@@ -10,6 +10,7 @@ description: Working rules for the outlook-web MCP tools (Outlook on the web thr
 1. `outlook_folders` with `unread_only: true` shows where the unread mail is (including subfolders of Deleted Items and rule-sorted folders).
 2. `outlook_read_unread` (no folder) reads all of it and marks it read. For a big backlog, go folder by folder.
 3. To find something, use `outlook_search` (`from:name`, `subject:words`) or `outlook_list` with `match`. Pinned conversations are listed separately and don't use up `limit`.
+   Open a search result with `outlook_read_search_result`, passing the same `query`: the tab is shared, so another call in between replaces the results on screen.
 4. Report what needs action, by date, and leave newsletters and notifications out unless asked.
 5. Read output shows links as `text <url>`. Pass a link on to the user when they need to act on it (verification, sign-up, forms).
 
@@ -60,6 +61,7 @@ Outlook sessions expire every so often. An expired page still looks normal apart
 
 ## When a tool fails
 
+- Call outlook tools one at a time, not in parallel: they share one browser tab, so parallel calls only queue, and a call that relies on what the page shows (a search's results) can find another call's page instead.
 - Retry the same outlook tool once (it reloads Outlook and clears pop-ups itself), then report the exact error.
 - Don't switch to general browser tools (Playwright MCP, screenshots plus clicking) to do Outlook work: they share the same browser and make things worse. Use `outlook_search` only as a different way to find mail, not as a workaround for a broken folder.
 - Never answer an Outlook prompt by guessing. Prompts about time zones, sending or deleting are for the user.
